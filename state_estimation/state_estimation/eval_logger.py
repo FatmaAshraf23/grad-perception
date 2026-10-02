@@ -22,8 +22,13 @@ StateEstimate (what control receives, /state_estimate) -- added 2026-10-02:
                             true pose AT THE MESSAGE'S STAMP (not the newest truth: a 10 ms
                             mismatch would look like 1.5 cm of error at 1.5 m/s)
   tr_vx, tr_vy              true body velocities (simulator twist) at that stamp
-  tr_r                      true yaw rate from the change of the true heading over +-20 ms
-                            (the simulator's twist.angular.z can stay stuck after stops)
+  tr_r                      true yaw rate = the simulator's yaw-rate state (twist.angular.z)
+                            of that truth sample, 0 while the car stands (< 0.05 m/s; the
+                            state has been seen stuck after stops). Until 2026-10-02 it was
+                            the heading change over +-20 ms: that counts 3, 4 or 5 physics
+                            steps of 10 ms depending on timing (error p95 0.034 rad/s,
+                            job 023); twist.angular.z matches the real rotation per physics
+                            step within 0.01 rad/s rms.
 File: ~/eval_logs/<run_name>_<YYYYmmdd_HHMMSS>.csv  (plot with plot_eval.py)
 """
 import math
@@ -75,7 +80,7 @@ class EvalLogger(Node):
         self.f.write(','.join(COLS) + '\n')
 
         self.truth = None
-        self.truth_hist = deque(maxlen=1500)         # (t_ns, x, y, yaw, vx, vy), a few s
+        self.truth_hist = deque(maxlen=1500)         # (t_ns, x, y, yaw, vx, vy, wz), a few s
         self.last_xy = None
         self.s = 0.0
         self.ekf = None
@@ -114,15 +119,16 @@ class EvalLogger(Node):
                 self.s += step
         self.last_xy = (x, y)
         self.truth = msg
-        tw = msg.twist.twist.linear
+        tw = msg.twist.twist
         self.truth_hist.append((Time.from_msg(msg.header.stamp).nanoseconds,
-                                x, y, yaw_from_quat(pp.orientation), tw.x, tw.y))
+                                x, y, yaw_from_quat(pp.orientation), tw.linear.x, tw.linear.y,
+                                tw.angular.z))
 
     def amcl_cb(self, msg):
         if not self.truth_hist:
             return
         t = Time.from_msg(msg.header.stamp).nanoseconds
-        _, tx, ty, tyaw, _, _ = min(self.truth_hist, key=lambda e: abs(e[0] - t))
+        _, tx, ty, tyaw, _, _, _ = min(self.truth_hist, key=lambda e: abs(e[0] - t))
         pp = msg.pose.pose
         self.amcl = (math.hypot(pp.position.x - tx, pp.position.y - ty),
                      math.degrees(wrap(yaw_from_quat(pp.orientation) - tyaw)))
@@ -132,13 +138,9 @@ class EvalLogger(Node):
         self.se_rx_ns = self.get_clock().now().nanoseconds
 
     def truth_at(self, t_ns):
-        """Truth sample nearest to t_ns, and the true yaw rate over +-20 ms around it."""
-        hist = self.truth_hist
-        near = min(hist, key=lambda e: abs(e[0] - t_ns))
-        a = min(hist, key=lambda e: abs(e[0] - (t_ns - 20_000_000)))
-        b = min(hist, key=lambda e: abs(e[0] - (t_ns + 20_000_000)))
-        dt = (b[0] - a[0]) * 1e-9
-        r = wrap(b[3] - a[3]) / dt if dt > 0.005 else float('nan')
+        """Truth sample nearest to t_ns, and the true yaw rate of that sample."""
+        near = min(self.truth_hist, key=lambda e: abs(e[0] - t_ns))
+        r = 0.0 if math.hypot(near[4], near[5]) < 0.05 else near[6]    # standing car: 0
         return near, r
 
     def se_columns(self):
@@ -147,7 +149,7 @@ class EvalLogger(Node):
             return [nan] * len(SE_COLS)
         m = self.se
         t_ns = m.stamp_us * 1000
-        (_, tx, ty, tyaw, tvx, tvy), tr_r = self.truth_at(t_ns)
+        (_, tx, ty, tyaw, tvx, tvy, _), tr_r = self.truth_at(t_ns)
         tr_s, s_tr, tr_ey, tr_epsi, tr_k = self.track.project(tx, ty, tyaw)
         if self.track_first and s_tr > self.track.L - 2.0:   # same rule as the node:
             self.track.lap = -1                              # started just behind the line
