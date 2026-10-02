@@ -40,7 +40,7 @@ from .frenet import FrenetTrack, load_xy_csv
 # Bump this when the math in frenet.py changes in a way that moves s, e_y,
 # e_psi or kappa (smoothing, resampling, curvature formula). Old hashes then
 # stop matching on purpose.
-GEOMETRY_VERSION = 1
+GEOMETRY_VERSION = 2   # v2 (2026-10-02): projection refined onto the smooth tangent
 
 
 def compute_track_hash(xy, smooth_m, ds, geometry_version=GEOMETRY_VERSION):

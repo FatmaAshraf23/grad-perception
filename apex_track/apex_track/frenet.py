@@ -132,6 +132,37 @@ class FrenetTrack:
         kappa = (1 - f) * self.kappa_seg[a] + f * self.kappa_seg[b]
         return theta, float(kappa)
 
+    def _eval(self, s):
+        """Centre-line point, smooth tangent angle and curvature at s in [0, L)."""
+        i = min(max(int(np.searchsorted(self.s0, s, side='right')) - 1, 0), self.n - 1)
+        t = (s - self.s0[i]) / self.seg_len[i]
+        theta, kappa = self._at(i, t)
+        return self.p[i, 0] + t * self.d[i, 0], self.p[i, 1] + t * self.d[i, 1], theta, kappa
+
+    def _refine(self, x, y, s):
+        """Move s until (pose - c(s)) is exactly perpendicular to the SMOOTH tangent.
+
+        Why (geometry v2, 2026-10-02): the closest point on the 5 cm polyline
+        and the smoothly interpolated tangent disagree near each polyline
+        kink; in Levine's sharpest corners that gave up to 11 mm in s and
+        17 mrad in e_psi on a pose -> Frenet -> pose round trip. A few Newton
+        steps on f(s) = (p - c(s)) . T(s) = 0 make position and direction come
+        from the same s, so the round trip is exact.
+        f'(s) = -(1 - kappa*e_y), the same factor as in the Frenet dynamics.
+        """
+        for _ in range(8):
+            cx, cy, th, k = self._eval(s)
+            dx, dy = x - cx, y - cy
+            f = dx * math.cos(th) + dy * math.sin(th)          # along-track miss
+            if abs(f) < 1e-9:
+                break
+            e_y = -dx * math.sin(th) + dy * math.cos(th)
+            den = max(1.0 - k * e_y, 0.2)                     # stay away from the singular point
+            step = max(-2 * self.seg_len.max(), min(2 * self.seg_len.max(), f / den))
+            s = (s + step) % self.L
+        cx, cy, th, k = self._eval(s)
+        return s, cx, cy, th, k
+
     def project(self, x, y, yaw):
         """(s_abs, s, e_y, e_psi, kappa) for a pose; updates the lap counter."""
         if self.s_prev is None:
@@ -144,9 +175,7 @@ class FrenetTrack:
                 i, t, _ = self._project(x, y, np.arange(self.n))
 
         s = (self.s0[i] + t * self.seg_len[i]) % self.L
-        theta, kappa = self._at(i, t)
-        qx = self.p[i, 0] + t * self.d[i, 0]
-        qy = self.p[i, 1] + t * self.d[i, 1]
+        s, qx, qy, theta, kappa = self._refine(x, y, s)
         e_y = math.cos(theta) * (y - qy) - math.sin(theta) * (x - qx)   # + = left
         e_psi = wrap(yaw - theta)
 
@@ -169,3 +198,23 @@ class FrenetTrack:
         t = (s - self.s0[i]) / self.seg_len[i]
         th, _ = self._at(i, t)
         return (self.p[i, 0] + t * self.d[i, 0], self.p[i, 1] + t * self.d[i, 1], th)
+
+    def kappa_at(self, s):
+        """Centre-line curvature [1/m] at s (+ = left turn). Any s (wraps, so
+        s_abs works too). s can be one number or a numpy array -- control's MPC
+        asks for the whole prediction horizon in one call.
+
+        Uses exactly the same interpolation as project(), so
+        kappa_at(s returned by project) == kappa returned by project.
+        """
+        s_arr = np.atleast_1d(np.asarray(s, dtype=float)) % self.L
+        i = np.searchsorted(self.s0, s_arr, side='right') - 1
+        i = np.clip(i, 0, self.n - 1)
+        t = (s_arr - self.s0[i]) / self.seg_len[i]
+        # same rule as _at(): between the middles of two neighbouring segments
+        upper = t >= 0.5
+        a = np.where(upper, i, (i - 1) % self.n)
+        b = np.where(upper, (i + 1) % self.n, i)
+        f = np.where(upper, t - 0.5, t + 0.5)
+        k = (1 - f) * self.kappa_seg[a] + f * self.kappa_seg[b]
+        return float(k[0]) if np.ndim(s) == 0 else k
