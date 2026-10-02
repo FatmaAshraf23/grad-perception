@@ -100,6 +100,7 @@ class FrenetTrack:
         self.max_e_y = max_e_y
         self.s_prev = None           # s in [0, L) of the last call
         self.lap = 0
+        self.reseeded = False        # did the LAST project() call need a global search?
 
     @classmethod
     def from_csv(cls, path, **kw):
@@ -165,6 +166,7 @@ class FrenetTrack:
 
     def project(self, x, y, yaw):
         """(s_abs, s, e_y, e_psi, kappa) for a pose; updates the lap counter."""
+        self.reseeded = self.s_prev is None          # True = this call used the global search
         if self.s_prev is None:
             i, t, _ = self._project(x, y, np.arange(self.n))
         else:
@@ -173,6 +175,7 @@ class FrenetTrack:
             i, t, d2 = self._project(x, y, idx)
             if d2 > self.max_e_y ** 2:              # lost the track -> global search
                 i, t, _ = self._project(x, y, np.arange(self.n))
+                self.reseeded = True
 
         s = (self.s0[i] + t * self.seg_len[i]) % self.L
         s, qx, qy, theta, kappa = self._refine(x, y, s)
