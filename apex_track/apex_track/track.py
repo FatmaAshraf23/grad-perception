@@ -1,0 +1,78 @@
+"""Track identity: ONE track definition file that every team member loads.
+
+A track is described by a small YAML file (example: tracks/levine/track.yaml):
+
+    track_id: levine           # human-readable name
+    centerline: centerline.csv # x,y points of the closed centre line, metres,
+                               #   map frame, first point = start/finish line
+    smooth_m: 0.5              # Gaussian smoothing along the arc [m]
+    ds: 0.05                   # resampling step of the smoothed curve [m]
+
+load_track(path) reads it and returns a FrenetTrack that also carries
+    .track_id    the name from the file
+    .track_hash  a 16-hex-character fingerprint of the GEOMETRY
+
+WHY A HASH (APEX contract, control's response 2026-10-02)
+    s, e_y, e_psi and kappa only mean the same thing to perception and control
+    if both use exactly the same centre line, smoothing and code. The name
+    alone can't guarantee that (someone edits the CSV and keeps the name).
+    The hash is computed from the things that change the geometry:
+        - the centre-line POINTS (rounded to 1 mm)
+        - smooth_m and ds
+        - GEOMETRY_VERSION (bumped whenever frenet.py's math changes)
+    Perception puts it in every StateEstimate; control compares it with its
+    own and rejects the message on a mismatch.
+
+WHY HASH THE NUMBERS, NOT THE FILE BYTES
+    The same CSV saved on Windows (CRLF line ends), with a trailing newline,
+    or written as 0.50 instead of 0.5 has different bytes but the same track.
+    Hashing the parsed points rounded to 1 mm gives the same hash for the
+    same geometry, whatever editor or OS touched the file.
+"""
+import hashlib
+import os
+
+import numpy as np
+import yaml
+
+from .frenet import FrenetTrack, load_xy_csv
+
+# Bump this when the math in frenet.py changes in a way that moves s, e_y,
+# e_psi or kappa (smoothing, resampling, curvature formula). Old hashes then
+# stop matching on purpose.
+GEOMETRY_VERSION = 1
+
+
+def compute_track_hash(xy, smooth_m, ds, geometry_version=GEOMETRY_VERSION):
+    """16-hex fingerprint of a track's geometry (see module docstring)."""
+    pts_mm = np.round(np.asarray(xy, dtype=float) * 1000.0).astype(np.int64)
+    h = hashlib.sha256()
+    h.update(f'apex_track geometry v{geometry_version}\n'.encode())
+    h.update(f'smooth_m={round(float(smooth_m), 4)} ds={round(float(ds), 4)}\n'.encode())
+    for x, y in pts_mm:
+        h.update(f'{x},{y}\n'.encode())
+    return h.hexdigest()[:16]
+
+
+def load_track(yaml_path, **frenet_kw):
+    """Read a track.yaml -> FrenetTrack with .track_id and .track_hash set.
+
+    Extra keyword arguments (window_m, max_e_y) go to FrenetTrack; they only
+    change the SEARCH, not the geometry, so they are not part of the hash.
+    """
+    yaml_path = os.path.abspath(os.path.expanduser(yaml_path))
+    with open(yaml_path, encoding='utf-8') as f:
+        cfg = yaml.safe_load(f)
+    for key in ('track_id', 'centerline', 'smooth_m', 'ds'):
+        if key not in cfg:
+            raise ValueError(f'{yaml_path}: missing "{key}"')
+
+    csv_path = os.path.join(os.path.dirname(yaml_path), cfg['centerline'])
+    xy = load_xy_csv(csv_path)
+    smooth_m, ds = float(cfg['smooth_m']), float(cfg['ds'])
+
+    track = FrenetTrack(xy, smooth_m=smooth_m, ds=ds, **frenet_kw)
+    track.track_id = str(cfg['track_id'])
+    track.track_hash = compute_track_hash(xy, smooth_m, ds)
+    track.source_file = yaml_path
+    return track

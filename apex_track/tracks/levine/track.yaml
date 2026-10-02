@@ -1,0 +1,7 @@
+# APEX track definition -- load with apex_track.load_track()
+# Simulator map: f1tenth_gym_ros maps/levine. Start/finish = first point (-0.025, -0.175),
+# driving direction = +x along the bottom corridor (counter-clockwise loop).
+track_id: levine
+centerline: centerline.csv
+smooth_m: 0.5      # OPEN: 0.5 vs 1.0 still to agree with control (see progress log)
+ds: 0.05

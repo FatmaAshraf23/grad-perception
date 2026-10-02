@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>apex_track</name>
+  <version>0.1.0</version>
+  <description>APEX shared track geometry: global pose to Frenet (s_abs, e_y, e_psi, kappa), track_id and track_hash. Pure Python, usable with or without ROS.</description>
+  <maintainer email="fatmaashraf54321@gmail.com">Fatma Ashraf</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
