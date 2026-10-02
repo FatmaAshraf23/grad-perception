@@ -17,7 +17,8 @@ ONE OUTPUT PER /odom/ekf MESSAGE, SAME TIMESTAMP
 
 WHAT IS HONEST AND WHAT IS STILL A PLACEHOLDER (v0, 2026-10-02)
     real    x, y, psi, r, s_abs, s_track, lap, e_y, e_psi, std_xy, std_psi,
-            std_e_y, std_e_psi, mode, flags, timing fields
+            std_e_y, std_e_psi (= sqrt(std_psi^2 + (kappa * std along track)^2)),
+            mode, flags, timing fields
     model   vx, vy from the no-slip KINEMATIC bicycle model at the CG
             (v = EKF speed, beta = atan(lr/(lf+lr) tan(steering))):
             vx = v cos(beta), vy = v sin(beta).  FLAG_VY_KINEMATIC is always set.
@@ -36,11 +37,12 @@ REFERENCE POINT
 
 MODES (contract section 6, thresholds provisional = parameters)
     INIT     until the first accepted AMCL correction and std_xy <= 0.15 m
-    OK       std_xy <= 0.15 m and an accepted AMCL fix within 0.3 s (or stopped)
-    DEGRADED std_xy 0.15-0.30 m, or no accepted fix for 0.3-1.0 s while moving
-    LOST     std_xy > 0.30 m, or no accepted fix for > 1.0 s while moving
-    LiDAR staleness only counts while MOVING: AMCL deliberately stops updating
-    when the car stands still (update_min_d), which is not a fault.
+    OK       std_xy <= 0.15 m and an accepted AMCL fix within the last 0.3 s of DRIVING
+    DEGRADED std_xy 0.15-0.30 m, or 0.3-1.0 s of driving without an accepted fix
+    LOST     std_xy > 0.30 m, or > 1.0 s of driving without an accepted fix
+    LiDAR staleness counts DRIVING time only: AMCL deliberately stops updating
+    while the car stands still (update_min_d), which is not a fault -- and after
+    a long wait at the start line the car must not be LOST the moment it sets off.
 
 Real car: identical node. Only the inputs change (STM32 bridge, MPU-6050
 driver, rplidar), see the implementation guide.
@@ -111,11 +113,13 @@ class StateEstimateNode(Node):
         self.last_wheel_t = None               # node clock (s) of the last /vehicle/measured
         self.last_imu_t = None
         self.last_fix_t = None                 # node clock (s) of the last ACCEPTED AMCL fix
+        self.driven_since_fix = 0.0            # s of DRIVING since that fix (standing doesn't count)
         self.prev = None                       # (t_s, x, y, v, psi) of the previous EKF message
         self.reset_pending = False
         self.mode = SE.MODE_INIT
         self.first = True
         self.lat_us, self.proc_us, self.mode_count = [], [], [0, 0, 0, 0]
+        self.clock_steps = 0                   # messages published BEFORE their own stamp
 
         self.pub = self.create_publisher(SE, '/state_estimate', 10)
         self.create_subscription(Odometry, '/odom/ekf', self.odom_cb, 50)
@@ -138,6 +142,7 @@ class StateEstimateNode(Node):
 
     def fix_cb(self, _msg):
         self.last_fix_t = self.now_s()
+        self.driven_since_fix = 0.0
 
     def reset_cb(self, _msg):
         self.reset_pending = True
@@ -180,10 +185,24 @@ class StateEstimateNode(Node):
         th = psi - e_psi                       # centre-line tangent heading
         n = np.array([-math.sin(th), math.cos(th)])
         std_e_y = math.sqrt(max(float(n @ Pxy @ n), 0.0))
+        # e_psi = psi - theta(s). An error ds in s reads the tangent at the wrong place, and in
+        # a corner theta turns kappa rad per metre -> e_psi error ~ -kappa*ds. So sigma(e_psi)
+        # also contains the position uncertainty ALONG the track (run se_b, 2026-10-02: 4-5 deg
+        # e_psi spikes in Levine's corners while sigma(psi) was ~0.3 deg -> only 67 % in 2 sigma).
+        tg = np.array([math.cos(th), math.sin(th)])
+        var_s = max(float(tg @ Pxy @ tg), 0.0)
+        std_e_psi = math.sqrt(std_psi ** 2 + kappa ** 2 * var_s)
 
         # health
         moving = abs(v) > p('moving_speed')
-        fix_age = None if self.last_fix_t is None else now - self.last_fix_t
+        # staleness = DRIVING time since the last accepted fix. AMCL deliberately pauses while
+        # the car stands still, so standing time is not a fault (run se_c 2026-10-02: the car
+        # waited 2.4 s after its first fix and was reported LOST for 0.26 s when it set off).
+        if moving and self.prev is not None:
+            dt_drive = (t_valid.nanoseconds * 1e-9) - self.prev[0]
+            if 0.0 < dt_drive < 0.5:
+                self.driven_since_fix += dt_drive
+        fix_age = None if self.last_fix_t is None else self.driven_since_fix
         lidar_stale = moving and (fix_age is None or fix_age > p('lidar_stale_s'))
         flags = SE.FLAG_VY_KINEMATIC
         if lidar_stale:
@@ -219,7 +238,7 @@ class StateEstimateNode(Node):
             mode = SE.MODE_OK
         if mode != self.mode:
             self.get_logger().info(f'mode {self.mode} -> {mode} (std_xy {std_xy*100:.1f} cm, '
-                                   f'fix age {fix_age if fix_age is None else round(fix_age, 2)} s)')
+                                   f'driven since fix {fix_age if fix_age is None else round(fix_age, 2)} s)')
         self.mode = mode
 
         # message
@@ -239,7 +258,7 @@ class StateEstimateNode(Node):
         m.std_vx_mps = max(p('std_vx_min'), p('std_vx_rel') * abs(vx))
         m.std_vy_mps = max(p('std_vy_min'), p('std_vy_rel') * abs(vx))
         m.std_r_radps = p('std_r')
-        m.std_e_y_m, m.std_e_psi_rad = std_e_y, std_psi
+        m.std_e_y_m, m.std_e_psi_rad = std_e_y, std_e_psi
         m.mode, m.flags = mode, flags
         m.valid_for_ms = p('valid_for_ms')
         m.publish_us = stamp_us(self.get_clock().now())   # last thing before sending
@@ -248,13 +267,24 @@ class StateEstimateNode(Node):
         self.seq = (self.seq + 1) % (1 << 32)
         self.first = False
         self.prev = (t_valid.nanoseconds * 1e-9, x, y, v, psi + beta)
-        self.lat_us.append(m.publish_us - m.stamp_us)
+        lat = m.publish_us - m.stamp_us
+        if lat < 0:
+            # only possible if the system clock stepped BACKWARDS while this message was in
+            # flight (WSL does this). Not estimator latency -> counted, kept out of the stats.
+            self.clock_steps += 1
+            if self.clock_steps == 1 or self.clock_steps % 10 == 0:
+                self.get_logger().warn(f'published {-lat / 1000:.1f} ms BEFORE its stamp -- the '
+                                       f'system clock stepped backwards ({self.clock_steps} so far). '
+                                       'Real car: time sync must slew, not step.')
+        else:
+            self.lat_us.append(lat)
         self.proc_us.append((time.perf_counter() - t_wall0) * 1e6)
         self.mode_count[mode] += 1
 
     def report(self):
         if not self.lat_us:
-            self.get_logger().info('waiting for /odom/ekf ...')
+            if self.seq == 0:
+                self.get_logger().info('waiting for /odom/ekf ...')
             return
         lat, proc = np.array(self.lat_us) / 1000.0, np.array(self.proc_us)
         n = len(lat)
@@ -263,7 +293,8 @@ class StateEstimateNode(Node):
         self.get_logger().info(
             f'{n} msgs ({n / self.get_parameter("stats_every_s").value:.0f} Hz) | latency stamp->publish '
             f'mean {lat.mean():.1f} p95 {np.percentile(lat, 95):.1f} max {lat.max():.1f} ms | '
-            f'node work mean {proc.mean():.0f} us | modes: {modes} | lap {self.track.lap}')
+            f'node work mean {proc.mean():.0f} us | modes: {modes} | lap {self.track.lap}'
+            + (f' | clock steps so far: {self.clock_steps}' if self.clock_steps else ''))
         self.lat_us, self.proc_us, self.mode_count = [], [], [0, 0, 0, 0]
 
 

@@ -15,12 +15,17 @@ Data flow
   /scan_a1 ─> sim_scan_relay ─ /scan_amcl ──┼──────────────> AMCL <─────────┘  (+ /map)
                                             │                  │ /amcl_pose, TF map->odom
                                             └─> ekf_global (map frame) <┘ ─> /odom/ekf
+                                                                                 │
+  apex_track (Frenet) ─────────────────────────────────> state_estimate <────────┘
+                                                         ─> /state_estimate (apex_msgs/StateEstimate)
+StateEstimate node: on by default; state_estimate:=false leaves it out.
 """
 import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -47,6 +52,7 @@ def generate_launch_description():
         DeclareLaunchArgument('use_amcl', default_value='true'),
         DeclareLaunchArgument('amcl_min_sigma_pos', default_value='0.10'),
         DeclareLaunchArgument('scale_file', default_value='~/.ros/ekf_speed_scale.yaml'),
+        DeclareLaunchArgument('state_estimate', default_value='true'),
 
         # Simulated car sensors
         se('fake_vehicle_sensors'),
@@ -84,4 +90,8 @@ def generate_launch_description():
             'odom_topic': '/odom/ekf', 'path_topic': '/odom/ekf_path',
             'diag_prefix': '/ekf',
             'scale_file': LaunchConfiguration('scale_file')}]),
+
+        # StateEstimate for control: /odom/ekf + apex_track -> /state_estimate (contract v0.2)
+        Node(package='state_estimation', executable='state_estimate', name='state_estimate',
+             output='screen', condition=IfCondition(LaunchConfiguration('state_estimate'))),
     ])
