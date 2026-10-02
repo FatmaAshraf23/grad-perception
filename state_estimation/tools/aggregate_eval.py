@@ -3,6 +3,8 @@
 Reads every *_summary.txt that plot_eval.py wrote in a folder, groups the runs by
 their run_name (the part before _YYYYMMDD_HHMMSS) and prints mean +- std per group.
 Each run is counted once, even if it appears in several summary files.
+Summaries whose FILE name starts with INVALID (runs renamed INVALID-<reason>_...)
+are skipped -- the run name inside the file is unchanged, so the file name decides.
 
 Usage:
     python3 aggregate_eval.py ~/eval_logs
@@ -30,6 +32,8 @@ SE_OK = re.compile(r'^SE\s+modes while driving: .*?OK ([\d.]+) %')
 folder = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else '~/eval_logs')
 runs = {}
 for path in sorted(glob.glob(os.path.join(folder, '*_summary.txt'))):
+    if os.path.basename(path).startswith('INVALID'):
+        continue        # runs renamed INVALID-<reason>_... are kept on disk but never counted
     name = None
     for line in open(path):
         line = line.strip()
