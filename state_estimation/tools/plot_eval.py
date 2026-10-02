@@ -11,7 +11,12 @@ Writes next to the (first) CSV:
     <name>_position.png     position error vs distance (EKF with +-2 sigma, AMCL, wheel)
     <name>_heading.png      heading error vs distance
     <name>_states.png       speed scale k and gyro bias vs distance, with the true values
+    <name>_frenet.png       StateEstimate s / e_y / e_psi errors vs distance (if logged)
     <name>_summary.txt      the numbers table (also printed)
+
+StateEstimate block (2026-10-02, only for CSVs with the se_* columns): errors of what control
+receives (s, e_y, e_psi, vx, vy, r) against the truth at the message's own timestamp, how often
+the e_y / e_psi errors stay inside the message's own +-2 sigma, latency, output rate, mode shares.
 """
 import argparse
 import math
@@ -55,6 +60,61 @@ def stats(x):
             f'p95 {np.percentile(x, 95):7.3f}  max {np.max(x):7.3f}')
 
 
+MODE_NAMES = ['INIT', 'OK', 'DEGRADED', 'LOST']
+
+
+def has_se(d):
+    return 'se_s' in d.dtype.names and np.any(np.isfinite(d['se_s']))
+
+
+def se_errors(d):
+    """StateEstimate minus truth. s, e_y in m; e_psi in deg; vx, vy in m/s; r in rad/s."""
+    return {
+        's': d['se_s'] - d['tr_s'],
+        'e_y': d['se_ey'] - d['tr_ey'],
+        'e_psi': wrap_deg(np.degrees(d['se_epsi'] - d['tr_epsi'])),
+        'vx': d['se_vx'] - d['tr_vx'],
+        'vy': d['se_vy'] - d['tr_vy'],
+        'r': d['se_r'] - d['tr_r'],
+    }
+
+
+def se_summary(d, m):
+    e = se_errors(d)
+    ok = m & np.isfinite(d['se_s'])
+    lines = ['StateEstimate (what control receives) vs truth at the message stamp:']
+    for key, unit in (('s', 'm'), ('e_y', 'm'), ('e_psi', 'deg'), ('vx', 'm/s'),
+                      ('vy', 'm/s'), ('r', 'rad/s')):
+        lines.append(f'SE    {key} error [{unit}]  {stats(np.abs(e[key][ok]))}')
+    straight = ok & (np.abs(d['tr_kappa']) < 0.05)
+    corner = ok & (np.abs(d['tr_kappa']) >= 0.3)
+    lines.append(f'SE    e_psi error straights [deg]  {stats(np.abs(e["e_psi"][straight]))}')
+    lines.append(f'SE    e_psi error corners [deg]  {stats(np.abs(e["e_psi"][corner]))}')
+    in_ey = np.abs(e['e_y'][ok]) <= 2 * d['se_std_ey'][ok]
+    in_ep = np.abs(np.radians(e['e_psi'][ok])) <= 2 * d['se_std_epsi'][ok]
+    lines.append(f'SE    e_y inside its +-2 sigma: {100 * np.mean(in_ey):.0f} %   '
+                 f'e_psi inside its +-2 sigma: {100 * np.mean(in_ep):.0f} % (ideal ~95 %)')
+    allr = np.isfinite(d['se_lat_ms'])
+    # A NEGATIVE latency (published before its own stamp) only happens when the system clock
+    # steps backwards while a message is in flight (seen under WSL, run se_c 2026-10-02).
+    # Those rows say nothing about the estimator -> left out, but counted.
+    neg = allr & (d['se_lat_ms'] < 0)
+    good = allr & ~neg
+    lines.append(f'SE    latency stamp->publish [ms]  {stats(d["se_lat_ms"][good])}')
+    lines.append(f'SE    age at subscriber [ms]  {stats(d["se_age_ms"][good])}')
+    if neg.any():
+        lines.append(f'SE    {int(neg.sum())} rows with NEGATIVE latency left out '
+                     '(system clock stepped backwards)')
+    seq, t = d['se_seq'][allr], d['t'][allr]
+    if len(seq) > 1 and t[-1] > t[0]:
+        lines.append(f'SE    output rate {(seq[-1] - seq[0]) / (t[-1] - t[0]):.1f} Hz '
+                     f'(from sequence_id over {t[-1] - t[0]:.0f} s)')
+    modes = d['se_mode'][ok]
+    share = ', '.join(f'{MODE_NAMES[i]} {100 * np.mean(modes == i):.1f} %' for i in range(4))
+    lines.append(f'SE    modes while driving: {share}')
+    return lines
+
+
 def summary(name, d, m):
     e_pos, e_yaw, w_pos, w_yaw = errors(d)
     inside = e_pos[m] <= 2 * d['e_sig'][m]
@@ -71,11 +131,17 @@ def summary(name, d, m):
         f'EKF error inside its +-2 sigma: {100 * np.mean(inside):.0f} % of samples (ideal ~95 %)',
         f'EKF position first 20 m [m]  {stats(e_pos[m & (d["s"] < 20.0)])}',
         f'EKF position after 20 m [m]  {stats(e_pos[m & (d["s"] >= 20.0)])}',
-        f'Speed scale k start {d["k"][np.flatnonzero(np.isfinite(d["k"]))[0]]:.4f}',
-        f'Speed scale k final {d["k"][-1]:.4f} (true {TRUE_K:.4f})',
-        f'Gyro bias final {math.degrees(d["bias"][-1]):.3f} deg/s '
-        f'(true {math.degrees(d["true_bias"][-1]):.3f})',
     ]
+    k_ok = np.flatnonzero(np.isfinite(d['k']))
+    if len(k_ok):                      # no EKF data at all -> leave these lines out
+        lines += [
+            f'Speed scale k start {d["k"][k_ok[0]]:.4f}',
+            f'Speed scale k final {d["k"][k_ok[-1]]:.4f} (true {TRUE_K:.4f})',
+            f'Gyro bias final {math.degrees(d["bias"][-1]):.3f} deg/s '
+            f'(true {math.degrees(d["true_bias"][-1]):.3f})',
+        ]
+    if has_se(d):
+        lines += se_summary(d, m)
     return '\n'.join(lines)
 
 
@@ -174,6 +240,32 @@ def main():
     a2.grid(True, alpha=0.3)
     fig.suptitle('Sensor errors learned by the EKF')
     fig.savefig(base + '_states.png', dpi=130, bbox_inches='tight')
+
+    # 5. StateEstimate Frenet errors (what control receives)
+    if has_se(d):
+        e = se_errors(d)
+        fig, (b1, b2, b3) = plt.subplots(3, 1, figsize=(9, 8), sharex=True)
+        b1.plot(s, 100 * e['s'], color=C_EKF, lw=1)
+        b1.set_ylabel('s error [cm]')
+        b2.fill_between(s, -200 * d['se_std_ey'], 200 * d['se_std_ey'], color=C_EKF, alpha=0.15,
+                        label='±2σ (from the message)')
+        b2.plot(s, 100 * e['e_y'], color=C_EKF, lw=1, label='e_y error')
+        b2.set_ylabel('e_y error [cm]')
+        b2.legend(loc='upper left')
+        b3.fill_between(s, -2 * np.degrees(d['se_std_epsi']), 2 * np.degrees(d['se_std_epsi']),
+                        color=C_EKF, alpha=0.15, label='±2σ (from the message)')
+        b3.plot(s, e['e_psi'], color=C_EKF, lw=1, label='e_psi error')
+        corner = np.abs(d['tr_kappa']) >= 0.3
+        b3.fill_between(s, -10, 10, where=corner, color='#999999', alpha=0.15, step='mid',
+                        label='corner (|κ| ≥ 0.3 1/m)')
+        b3.set_ylim(-10, 10)
+        b3.set_ylabel('e_psi error [deg]')
+        b3.set_xlabel('distance driven [m]')
+        b3.legend(loc='upper left')
+        for b in (b1, b2, b3):
+            b.grid(True, alpha=0.3)
+        fig.suptitle('StateEstimate (what control receives) minus truth')
+        fig.savefig(base + '_frenet.png', dpi=130, bbox_inches='tight')
 
     print(f'\nFigures and summary written next to {args.csv[0]}')
 
