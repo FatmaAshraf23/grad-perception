@@ -71,6 +71,7 @@ class WheelOdometry(Node):
         self.declare_parameter('y0', 0.8)
         self.declare_parameter('yaw0', 0.0)
         self.declare_parameter('frame_id', 'map')
+        self.declare_parameter('path_max_len', 1500)   # poses kept (5 per s -> 5 min)
 
         self.x = self.get_parameter('x0').value
         self.y = self.get_parameter('y0').value
@@ -146,6 +147,7 @@ class WheelOdometry(Node):
         (ps.pose.orientation.x, ps.pose.orientation.y,
          ps.pose.orientation.z, ps.pose.orientation.w) = quat_from_yaw(self.yaw)
         self.path.poses.append(ps)
+        del self.path.poses[:-self.get_parameter('path_max_len').value]
         self.path.header.stamp = now
         self.path_pub.publish(self.path)
 
@@ -155,6 +157,7 @@ class WheelOdometry(Node):
             ts.header.stamp = now
             ts.pose = self.truth.pose.pose
             self.truth_path.poses.append(ts)
+            del self.truth_path.poses[:-self.get_parameter('path_max_len').value]
             self.truth_path.header.stamp = now
             self.truth_path_pub.publish(self.truth_path)
 

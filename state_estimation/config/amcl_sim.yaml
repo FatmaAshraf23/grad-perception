@@ -1,0 +1,59 @@
+# AMCL settings for the simulator (RPLIDAR A1-like scan, wall map).
+# Copy to:  ~/ros2_ws/src/state_estimation/config/amcl_sim.yaml
+# The start pose (initial_pose) is set from the launch file.
+amcl:
+  ros__parameters:
+    use_sim_time: false
+
+    # --- Frames (see sim_scan_relay.py for why these are 'est/...') ---
+    global_frame_id: "map"
+    odom_frame_id: "odom"
+    base_frame_id: "est/base_link"
+    scan_topic: "/scan_amcl"
+    map_topic: "/map"
+    tf_broadcast: true            # AMCL publishes map -> odom
+    transform_tolerance: 0.3      # s
+
+    # --- Particles ---
+    min_particles: 500
+    max_particles: 1000
+    pf_err: 0.05
+    pf_z: 0.99
+    resample_interval: 1
+    update_min_d: 0.05            # m    filter after this much motion...
+    update_min_a: 0.05            # rad  ...or this much rotation
+    recovery_alpha_slow: 0.0      # no random particles for now (turn on for
+    recovery_alpha_fast: 0.0      # "kidnapped robot" recovery later)
+
+    # --- Motion model: how much noise to add when moving the particles ---
+    # Our local EKF is good (few cm per m), so these are smaller than the
+    # defaults (0.2). alpha1: rotation noise from rotation, alpha2: rotation
+    # noise from translation, alpha3: translation noise from translation,
+    # alpha4: translation noise from rotation.
+    robot_model_type: "nav2_amcl::DifferentialMotionModel"
+    alpha1: 0.1
+    alpha2: 0.1
+    alpha3: 0.1
+    alpha4: 0.1
+    alpha5: 0.0
+
+    # --- Sensor model: how a scan is scored against the wall map ---
+    laser_model_type: "likelihood_field"
+    laser_min_range: 0.15
+    laser_max_range: 12.0         # RPLIDAR A1
+    max_beams: 60                 # use 60 of the 360 beams (speed)
+    z_hit: 0.8                    # beam hit a wall where the map says
+    z_rand: 0.2                   # random reading
+    z_max: 0.05
+    z_short: 0.05
+    sigma_hit: 0.1                # m, how far off a "good" hit may be
+    laser_likelihood_max_dist: 2.0
+    do_beamskip: false
+
+    # --- Start pose (overridden by the launch file) ---
+    set_initial_pose: true
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
