@@ -10,6 +10,7 @@ Then:  python3 plot_eval.py ~/eval_logs/<file>.csv --map <levine.yaml>
 Arguments: run_name, laps, v_max, amcl_min_sigma_pos (EKF trust in AMCL, m,
 default 0.10 since 2026-10-01), numpy_threads (BLAS threads per node, default 1),
 pipeline (separate = 3 processes, merged = ONE process for both EKFs + state_estimate),
+sim_sensors (v1 | v3: simulated gyro + wheel-speed model, see sim_localization),
 scale_file (speed-scale calibration;
 scale_file:=none = start uncalibrated with k = 1, the old behaviour).
 Do NOT run teleop at the same time (both would send drive commands).
@@ -34,7 +35,8 @@ def generate_launch_description():
                           'numpy_threads': LaunchConfiguration('numpy_threads'),
                           'ekf_path_period': LaunchConfiguration('ekf_path_period'),
                           'ekf_truth_topic': LaunchConfiguration('ekf_truth_topic'),
-                          'pipeline': LaunchConfiguration('pipeline')}.items(),
+                          'pipeline': LaunchConfiguration('pipeline'),
+                          'sim_sensors': LaunchConfiguration('sim_sensors')}.items(),
     )
     driver = Node(
         package='state_estimation', executable='test_driver', name='test_driver', output='screen',
@@ -55,6 +57,7 @@ def generate_launch_description():
         DeclareLaunchArgument('ekf_path_period', default_value='0.0'),
         DeclareLaunchArgument('ekf_truth_topic', default_value='none'),
         DeclareLaunchArgument('pipeline', default_value='merged'),     # or separate (3 processes)
+        DeclareLaunchArgument('sim_sensors', default_value='v3'),      # or v1 (old gyro + speed models)
         # CPU rule (also for test_driver and eval_logger, which start here)
         SetEnvironmentVariable('OPENBLAS_NUM_THREADS', LaunchConfiguration('numpy_threads')),
         SetEnvironmentVariable('OMP_NUM_THREADS', LaunchConfiguration('numpy_threads')),

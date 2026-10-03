@@ -30,6 +30,13 @@ pipeline (2026-10-03):
                        ekf_global hands its output to state_estimate directly. Same
                        parameters, topics and TF.
   separate           = the same three nodes as 3 processes (the old layout, for comparison)
+sim_sensors (2026-10-03): model of the simulated gyro (fake_imu) and wheel speed
+  (fake_vehicle_sensors). v1 = gyro from the pose difference per reading (0x/2x
+  readings in turns), speed = the simulator's speed state (keeps "driving" in a
+  simulator pause); v3 = pause_proof.PauseProofRate for both: smooth and pause-proof.
+lifecycle (2026-10-03): who switches AMCL on. activator (default) = our lifecycle_activator,
+  which re-reads AMCL's state and retries when a reply is lost; nav2 = nav2's lifecycle
+  manager, which waited forever when its first reply was lost (jobs 040/041).
 """
 import os
 import tempfile
@@ -38,6 +45,7 @@ import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction, SetEnvironmentVariable
+from launch.conditions import LaunchConfigurationEquals
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -136,6 +144,13 @@ def generate_launch_description():
         DeclareLaunchArgument('ekf_truth_topic', default_value='none'),
         # merged = ONE process (state_pipeline, default since job 038); separate = 3 processes
         DeclareLaunchArgument('pipeline', default_value='merged'),
+        # simulated gyro + wheel-speed model (simulation only): v3 (pause-proof, default since
+        # job 041: StateEstimate r error p95 0.31 -> 0.011 rad/s) or v1 (old)
+        DeclareLaunchArgument('sim_sensors', default_value='v3'),
+        # who switches AMCL on: activator (retries, default) or nav2 (old lifecycle manager);
+        # activator_timeout = seconds without a reply before it re-reads the state (tests: 0.05)
+        DeclareLaunchArgument('lifecycle', default_value='activator'),
+        DeclareLaunchArgument('activator_timeout', default_value='2.0'),
 
         # CPU rule: limit numpy's math-library threads for every node below
         SetEnvironmentVariable('OPENBLAS_NUM_THREADS', LaunchConfiguration('numpy_threads')),
@@ -143,8 +158,8 @@ def generate_launch_description():
         SetEnvironmentVariable('MKL_NUM_THREADS', LaunchConfiguration('numpy_threads')),
 
         # Simulated car sensors
-        se('fake_vehicle_sensors'),
-        se('fake_imu'),
+        se('fake_vehicle_sensors', params=[{'model': LaunchConfiguration('sim_sensors')}]),
+        se('fake_imu', params=[{'model': LaunchConfiguration('sim_sensors')}]),
         # Old wheel-only odometry, kept for comparison (red path)
         se('wheel_odometry', params=[{'x0': f(x0), 'y0': f(y0), 'yaw0': f(yaw0)}]),
 
@@ -158,7 +173,16 @@ def generate_launch_description():
         Node(package='nav2_amcl', executable='amcl', name='amcl', output='screen',
              parameters=[amcl_yaml, {'initial_pose.x': f(x0), 'initial_pose.y': f(y0),
                                      'initial_pose.yaw': f(yaw0)}]),
+        # AMCL is a lifecycle node: it waits to be configured and activated. Default: our
+        # lifecycle_activator, which re-reads the state and retries when a reply is lost. nav2's
+        # lifecycle manager waited forever then (jobs 040/041: AMCL never activated, no fixes;
+        # starting it 1.5 s later did not help). lifecycle:=nav2 = the old manager.
+        Node(package='state_estimation', executable='lifecycle_activator', name='lifecycle_activator',
+             output='screen', condition=LaunchConfigurationEquals('lifecycle', 'activator'),
+             parameters=[{'node_names': ['amcl'],
+                          'call_timeout_s': f(LaunchConfiguration('activator_timeout'))}]),
         Node(package='nav2_lifecycle_manager', executable='lifecycle_manager',
              name='lifecycle_manager_localization', output='screen',
+             condition=LaunchConfigurationEquals('lifecycle', 'nav2'),
              parameters=[{'autostart': True, 'node_names': ['amcl']}]),
     ])
