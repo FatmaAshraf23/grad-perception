@@ -34,6 +34,8 @@ sim_sensors (2026-10-03): model of the simulated gyro (fake_imu) and wheel speed
   (fake_vehicle_sensors). v1 = gyro from the pose difference per reading (0x/2x
   readings in turns), speed = the simulator's speed state (keeps "driving" in a
   simulator pause); v3 = pause_proof.PauseProofRate for both: smooth and pause-proof.
+steer_calib_file (2026-10-03): steering calibration written by steer_calib, read by both
+  EKFs and state_estimate (default ~/.ros/steering_calibration.yaml; none = no correction).
 lifecycle (2026-10-03): who switches AMCL on. activator (default) = our lifecycle_activator,
   which re-reads AMCL's state and retries when a reply is lost; nav2 = nav2's lifecycle
   manager, which waited forever when its first reply was lost (jobs 040/041).
@@ -74,7 +76,9 @@ def _ekfs_and_state_estimate(context):
     """ekf_local + ekf_global (+ state_estimate): 3 processes, or ONE (pipeline:=merged)."""
     arg = lambda n: LaunchConfiguration(n).perform(context).strip()   # noqa: E731
     yes = lambda n: arg(n).lower() in ('1', 'true', 'yes', 'on')      # noqa: E731
-    common = {'path_period_s': float(arg('ekf_path_period')), 'scale_file': arg('scale_file')}
+    common = {'path_period_s': float(arg('ekf_path_period')), 'scale_file': arg('scale_file'),
+              'steer_calib_file': arg('steer_calib_file')}
+    se = {'steer_calib_file': arg('steer_calib_file')}
     # LOCAL EKF: odometry for AMCL, starts at the origin of the odom frame
     local = dict(common, **{
         'mode': 'odom', 'frame_id': 'odom', 'child_frame_id': 'est/base_link',
@@ -97,7 +101,8 @@ def _ekfs_and_state_estimate(context):
         # ONE process. Node names come from the code (a __node remap would rename all three);
         # parameters from a file with one section per node name.
         return [Node(package='state_estimation', executable='state_pipeline', output='screen',
-                     parameters=[_params_file({'ekf_local': local, 'ekf_global': glob})],
+                     parameters=[_params_file({'ekf_local': local, 'ekf_global': glob,
+                                               'state_estimate': se})],
                      arguments=[] if with_se else ['--no-state-estimate'])]
     if pipeline != 'separate':
         raise RuntimeError(f"pipeline:={pipeline} -- use 'separate' or 'merged'")
@@ -110,7 +115,7 @@ def _ekfs_and_state_estimate(context):
     if with_se:
         # StateEstimate for control: /odom/ekf + apex_track -> /state_estimate (contract v0.2)
         actions.append(Node(package='state_estimation', executable='state_estimate',
-                            name='state_estimate', output='screen'))
+                            name='state_estimate', output='screen', parameters=[se]))
     return actions
 
 
@@ -150,6 +155,8 @@ def generate_launch_description():
         # who switches AMCL on: activator (retries, default) or nav2 (old lifecycle manager);
         # activator_timeout = seconds without a reply before it re-reads the state (tests: 0.05)
         DeclareLaunchArgument('lifecycle', default_value='activator'),
+        # steering calibration (steer_calib) for both EKFs + state_estimate; none = no correction
+        DeclareLaunchArgument('steer_calib_file', default_value='~/.ros/steering_calibration.yaml'),
         DeclareLaunchArgument('activator_timeout', default_value='2.0'),
 
         # CPU rule: limit numpy's math-library threads for every node below

@@ -36,7 +36,8 @@ def generate_launch_description():
                           'ekf_path_period': LaunchConfiguration('ekf_path_period'),
                           'ekf_truth_topic': LaunchConfiguration('ekf_truth_topic'),
                           'pipeline': LaunchConfiguration('pipeline'),
-                          'sim_sensors': LaunchConfiguration('sim_sensors')}.items(),
+                          'sim_sensors': LaunchConfiguration('sim_sensors'),
+                          'steer_calib_file': LaunchConfiguration('steer_calib_file')}.items(),
     )
     driver = Node(
         package='state_estimation', executable='test_driver', name='test_driver', output='screen',
@@ -58,6 +59,7 @@ def generate_launch_description():
         DeclareLaunchArgument('ekf_truth_topic', default_value='none'),
         DeclareLaunchArgument('pipeline', default_value='merged'),     # or separate (3 processes)
         DeclareLaunchArgument('sim_sensors', default_value='v3'),      # or v1 (old gyro + speed models)
+        DeclareLaunchArgument('steer_calib_file', default_value='~/.ros/steering_calibration.yaml'),
         # CPU rule (also for test_driver and eval_logger, which start here)
         SetEnvironmentVariable('OPENBLAS_NUM_THREADS', LaunchConfiguration('numpy_threads')),
         SetEnvironmentVariable('OMP_NUM_THREADS', LaunchConfiguration('numpy_threads')),
