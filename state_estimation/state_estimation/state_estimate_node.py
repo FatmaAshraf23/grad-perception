@@ -60,6 +60,7 @@ from ackermann_msgs.msg import AckermannDriveStamped
 from ament_index_python.packages import get_package_share_directory
 from apex_msgs.msg import StateEstimate as SE
 from apex_track import load_track, wrap
+from state_estimation.calibration import load_steering
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
@@ -106,6 +107,8 @@ class StateEstimateNode(Node):
         d('std_vy_rel', 0.05); d('std_vy_min', 0.02)
         d('std_r', 0.01)
         d('stats_every_s', 5.0)
+        # steering calibration (steer_calib) for beta -> vx, vy; 'none' = measured steering as it is
+        d('steer_calib_file', '~/.ros/steering_calibration.yaml')
         p = lambda n: self.get_parameter(n).value  # noqa: E731
 
         path = p('track_yaml') or (get_package_share_directory('apex_track')
@@ -113,6 +116,11 @@ class StateEstimateNode(Node):
         self.track = load_track(path)
         self.get_logger().info(f'track {self.track.track_id}, hash {self.track.track_hash}, '
                                f'L = {self.track.L:.2f} m ({path})')
+        self.steer_cal, problem = load_steering(p('steer_calib_file'))
+        if problem:
+            self.get_logger().warn(problem)
+        else:
+            self.get_logger().info(self.steer_cal.describe())
 
         self.seq = 0
         self.steer = 0.0
@@ -141,7 +149,7 @@ class StateEstimateNode(Node):
 
     # --- inputs used only for health ------------------------------------------------
     def wheel_cb(self, msg):
-        self.steer = msg.drive.steering_angle
+        self.steer = self.steer_cal.correct(msg.drive.steering_angle)
         self.last_wheel_t = self.now_s()
 
     def imu_cb(self, _msg):

@@ -69,6 +69,11 @@ UPDATE 2 -- AMCL pose (global EKF only)                       NEW in v3
     0.9683 -> 0.9679 (true 0.9709) while every uncalibrated run ended within
     0.05 % of the truth.
 
+    STEERING CALIBRATION (2026-10-03): beta uses the steering corrected with the
+    file of steer_calib: delta = gain * (delta_measured - offset) (calibration.py,
+    parameter steer_calib_file; no file = no correction). A +0.01 rad steering
+    offset made beta 0.30 deg too large and the heading 0.30 deg too low.
+
     RECOVERY: if AMCL is rejected `reset_after_rejects` times in a row, the
     EKF assumes it is the one that is lost (e.g. after a collision) and resets
     its pose to AMCL's.
@@ -251,6 +256,8 @@ try:
     from sensor_msgs.msg import Imu
     from std_msgs.msg import Float64
     from tf2_ros import TransformBroadcaster
+
+    from state_estimation.calibration import load_steering
 except ImportError:
     Node = object
 
@@ -306,6 +313,8 @@ class EkfNode(Node):
         # Zero-velocity detection
         d('stopped_speed', 0.01)
         d('stopped_time', 0.3)
+        # Steering calibration (steer_calib); 'none' = use the measured steering as it is
+        d('steer_calib_file', '~/.ros/steering_calibration.yaml')
         # Speed-scale calibration file (see docstring)
         d('scale_file', 'none')             # anchor (READ only); 'none' = start with k = 1
         d('scale_learned_file', '~/.ros/ekf_speed_scale_learned.yaml')  # global EKF writes
@@ -324,6 +333,11 @@ class EkfNode(Node):
         k0, sigma_k0 = self.load_scale(1.0, p('sigma_scale0'))
         self.k_anchor = k0 if self.scale_file and k0 != 1.0 else None
         self.warned_scale = False
+        self.steer_cal, problem = load_steering(p('steer_calib_file'))
+        if problem:
+            self.get_logger().warn(problem)
+        else:
+            self.get_logger().info(self.steer_cal.describe())
         self.ekf = LocalizationEKF(
             x0=[p('x0'), p('y0'), p('yaw0'), 0.0, k0],
             P0_diag=[p('sigma_pos0'), p('sigma_pos0'), math.radians(p('sigma_yaw0_deg')),
@@ -438,7 +452,7 @@ class EkfNode(Node):
 
     def meas_cb(self, msg):
         self.v = msg.drive.speed
-        self.steer = msg.drive.steering_angle
+        self.steer = self.steer_cal.correct(msg.drive.steering_angle)
         now = Time.from_msg(msg.header.stamp)
         if abs(self.v) < self.get_parameter('stopped_speed').value:
             if self.stopped_since is None:
