@@ -44,6 +44,10 @@ MODES (contract section 6, thresholds provisional = parameters)
     while the car stands still (update_min_d), which is not a fault -- and after
     a long wait at the start line the car must not be LOST the moment it sets off.
 
+MERGED PIPELINE (2026-10-03): state_pipeline.py runs this node in the same process
+as both EKFs (own_inputs=False) and calls odom_cb / wheel_cb / imu_cb / fix_cb
+directly -- one IMU and one wheel subscription for all three nodes.
+
 Real car: identical node. Only the inputs change (STM32 bridge, MPU-6050
 driver, rplidar), see the implementation guide.
 """
@@ -76,7 +80,9 @@ def stamp_us(t):
 
 class StateEstimateNode(Node):
 
-    def __init__(self):
+    def __init__(self, own_inputs=True):
+        # own_inputs=False: state_pipeline.py (same process as both EKFs) calls odom_cb,
+        # wheel_cb, imu_cb and fix_cb directly instead of through subscriptions
         super().__init__('state_estimate')
         d = self.declare_parameter
         d('track_yaml', '')                    # '' = apex_track's tracks/<track>/track.yaml
@@ -122,10 +128,11 @@ class StateEstimateNode(Node):
         self.clock_steps = 0                   # messages published BEFORE their own stamp
 
         self.pub = self.create_publisher(SE, '/state_estimate', 10)
-        self.create_subscription(Odometry, '/odom/ekf', self.odom_cb, 50)
-        self.create_subscription(AckermannDriveStamped, '/vehicle/measured', self.wheel_cb, 50)
-        self.create_subscription(Imu, '/imu/data', self.imu_cb, 100)
-        self.create_subscription(Float64, '/ekf/nis', self.fix_cb, 10)
+        if own_inputs:
+            self.create_subscription(Odometry, '/odom/ekf', self.odom_cb, 50)
+            self.create_subscription(AckermannDriveStamped, '/vehicle/measured', self.wheel_cb, 50)
+            self.create_subscription(Imu, '/imu/data', self.imu_cb, 100)
+            self.create_subscription(Float64, '/ekf/nis', self.fix_cb, 10)
         self.create_subscription(PoseWithCovarianceStamped, '/initialpose', self.reset_cb, 10)
         self.create_timer(p('stats_every_s'), self.report)
 
