@@ -19,23 +19,97 @@ Data flow
   apex_track (Frenet) ─────────────────────────────────> state_estimate <────────┘
                                                          ─> /state_estimate (apex_msgs/StateEstimate)
 StateEstimate node: on by default; state_estimate:=false leaves it out.
+numpy_threads (default 1): BLAS/OpenMP threads for every node started here (CPU rule,
+2026-10-03). numpy's OpenBLAS otherwise starts one busy-waiting thread per core: ekf_node
+used ~190 % CPU for 5x5 matrices. Same setting on the real car (Pi 4 has only 4 cores).
+pipeline (2026-10-03):
+  merged (default)   = ekf_local, ekf_global and state_estimate in ONE process (executable
+                       state_pipeline; job 038: the three 80 % -> 36 % of one laptop core,
+                       StateEstimate latency p95 8.2 -> 3.2 ms, accuracy unchanged):
+                       the IMU and wheel messages are received once instead of 3 times, and
+                       ekf_global hands its output to state_estimate directly. Same
+                       parameters, topics and TF.
+  separate           = the same three nodes as 3 processes (the old layout, for comparison)
 """
 import os
+import tempfile
 
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.conditions import IfCondition
+from launch.actions import DeclareLaunchArgument, OpaqueFunction, SetEnvironmentVariable
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+
+
+class _QuotedStr(str):
+    """A string written in quotes, so the ROS YAML parser never reads it as a bool/number."""
+
+
+yaml.add_representer(_QuotedStr, lambda dumper, s: dumper.represent_scalar(
+    'tag:yaml.org,2002:str', s, style='"'), Dumper=yaml.SafeDumper)
+
+
+def _params_file(sections):
+    """{node_name: {param: value}} -> YAML params file with one section per node; its path."""
+    doc = {f'/{name}': {'ros__parameters': {k: _QuotedStr(v) if isinstance(v, str) else v
+                                            for k, v in params.items()}}
+           for name, params in sections.items()}
+    fd, path = tempfile.mkstemp(prefix='state_pipeline_', suffix='.yaml')
+    with os.fdopen(fd, 'w') as f:
+        yaml.dump(doc, f, Dumper=yaml.SafeDumper, default_flow_style=False)
+    return path
+
+
+def _ekfs_and_state_estimate(context):
+    """ekf_local + ekf_global (+ state_estimate): 3 processes, or ONE (pipeline:=merged)."""
+    arg = lambda n: LaunchConfiguration(n).perform(context).strip()   # noqa: E731
+    yes = lambda n: arg(n).lower() in ('1', 'true', 'yes', 'on')      # noqa: E731
+    common = {'path_period_s': float(arg('ekf_path_period')), 'scale_file': arg('scale_file')}
+    # LOCAL EKF: odometry for AMCL, starts at the origin of the odom frame
+    local = dict(common, **{
+        'mode': 'odom', 'frame_id': 'odom', 'child_frame_id': 'est/base_link',
+        'publish_tf': True, 'use_amcl': False,
+        'x0': 0.0, 'y0': 0.0, 'yaw0': 0.0,
+        'odom_topic': '/odom/ekf_local', 'path_topic': '/odom/ekf_local_path',
+        'diag_prefix': '/ekf_local'})
+    # GLOBAL EKF: the pose planning/MPC will use
+    glob = dict(common, **{
+        'mode': 'map', 'frame_id': 'map', 'child_frame_id': 'est/base_link',
+        'publish_tf': False, 'use_amcl': yes('use_amcl'),
+        'amcl_min_sigma_pos': float(arg('amcl_min_sigma_pos')),
+        'x0': float(arg('x0')), 'y0': float(arg('y0')), 'yaw0': float(arg('yaw0')),
+        'odom_topic': '/odom/ekf', 'path_topic': '/odom/ekf_path',
+        'diag_prefix': '/ekf', 'truth_topic': arg('ekf_truth_topic')})
+    with_se = yes('state_estimate')
+    pipeline = arg('pipeline').lower()
+
+    if pipeline == 'merged':
+        # ONE process. Node names come from the code (a __node remap would rename all three);
+        # parameters from a file with one section per node name.
+        return [Node(package='state_estimation', executable='state_pipeline', output='screen',
+                     parameters=[_params_file({'ekf_local': local, 'ekf_global': glob})],
+                     arguments=[] if with_se else ['--no-state-estimate'])]
+    if pipeline != 'separate':
+        raise RuntimeError(f"pipeline:={pipeline} -- use 'separate' or 'merged'")
+    actions = [
+        Node(package='state_estimation', executable='ekf_node', name='ekf_local',
+             output='screen', parameters=[local]),
+        Node(package='state_estimation', executable='ekf_node', name='ekf_global',
+             output='screen', parameters=[glob]),
+    ]
+    if with_se:
+        # StateEstimate for control: /odom/ekf + apex_track -> /state_estimate (contract v0.2)
+        actions.append(Node(package='state_estimation', executable='state_estimate',
+                            name='state_estimate', output='screen'))
+    return actions
 
 
 def generate_launch_description():
     x0 = LaunchConfiguration('x0')
     y0 = LaunchConfiguration('y0')
     yaw0 = LaunchConfiguration('yaw0')
-    use_amcl = LaunchConfiguration('use_amcl')
     f = lambda s: ParameterValue(s, value_type=float)  # noqa: E731
 
     amcl_yaml = os.path.join(get_package_share_directory('state_estimation'),
@@ -53,6 +127,20 @@ def generate_launch_description():
         DeclareLaunchArgument('amcl_min_sigma_pos', default_value='0.10'),
         DeclareLaunchArgument('scale_file', default_value='~/.ros/ekf_speed_scale.yaml'),
         DeclareLaunchArgument('state_estimate', default_value='true'),
+        DeclareLaunchArgument('numpy_threads', default_value='1'),
+        # View/sim-only extras of the EKFs (CPU, 2026-10-03): path for Foxglove (s, 0 = off)
+        # and the simulator truth in ekf_global's 2-s report ('none' = off). Both OFF by default:
+        # job 036 -> truth (250 Hz) doubled ekf_global's CPU (44 % -> 22 % without it);
+        # viewing: ekf_path_period:=0.2 ekf_truth_topic:=/ego_racecar/odom
+        DeclareLaunchArgument('ekf_path_period', default_value='0.0'),
+        DeclareLaunchArgument('ekf_truth_topic', default_value='none'),
+        # merged = ONE process (state_pipeline, default since job 038); separate = 3 processes
+        DeclareLaunchArgument('pipeline', default_value='merged'),
+
+        # CPU rule: limit numpy's math-library threads for every node below
+        SetEnvironmentVariable('OPENBLAS_NUM_THREADS', LaunchConfiguration('numpy_threads')),
+        SetEnvironmentVariable('OMP_NUM_THREADS', LaunchConfiguration('numpy_threads')),
+        SetEnvironmentVariable('MKL_NUM_THREADS', LaunchConfiguration('numpy_threads')),
 
         # Simulated car sensors
         se('fake_vehicle_sensors'),
@@ -60,14 +148,8 @@ def generate_launch_description():
         # Old wheel-only odometry, kept for comparison (red path)
         se('wheel_odometry', params=[{'x0': f(x0), 'y0': f(y0), 'yaw0': f(yaw0)}]),
 
-        # LOCAL EKF: odometry for AMCL, starts at the origin of the odom frame
-        se('ekf_local', 'ekf_node', [{
-            'mode': 'odom', 'frame_id': 'odom', 'child_frame_id': 'est/base_link',
-            'publish_tf': True, 'use_amcl': False,
-            'x0': 0.0, 'y0': 0.0, 'yaw0': 0.0,
-            'odom_topic': '/odom/ekf_local', 'path_topic': '/odom/ekf_local_path',
-            'diag_prefix': '/ekf_local',
-            'scale_file': LaunchConfiguration('scale_file')}]),
+        # The two EKFs + StateEstimate: 3 processes or one (see pipeline above)
+        OpaqueFunction(function=_ekfs_and_state_estimate),
 
         # Scan in the estimated car's frame (simulation only)
         se('sim_scan_relay'),
@@ -79,19 +161,4 @@ def generate_launch_description():
         Node(package='nav2_lifecycle_manager', executable='lifecycle_manager',
              name='lifecycle_manager_localization', output='screen',
              parameters=[{'autostart': True, 'node_names': ['amcl']}]),
-
-        # GLOBAL EKF: the pose planning/MPC will use
-        se('ekf_global', 'ekf_node', [{
-            'mode': 'map', 'frame_id': 'map', 'child_frame_id': 'est/base_link',
-            'publish_tf': False,
-            'use_amcl': ParameterValue(use_amcl, value_type=bool),
-            'amcl_min_sigma_pos': f(LaunchConfiguration('amcl_min_sigma_pos')),
-            'x0': f(x0), 'y0': f(y0), 'yaw0': f(yaw0),
-            'odom_topic': '/odom/ekf', 'path_topic': '/odom/ekf_path',
-            'diag_prefix': '/ekf',
-            'scale_file': LaunchConfiguration('scale_file')}]),
-
-        # StateEstimate for control: /odom/ekf + apex_track -> /state_estimate (contract v0.2)
-        Node(package='state_estimation', executable='state_estimate', name='state_estimate',
-             output='screen', condition=IfCondition(LaunchConfiguration('state_estimate'))),
     ])
