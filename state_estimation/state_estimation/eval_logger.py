@@ -22,13 +22,30 @@ StateEstimate (what control receives, /state_estimate) -- added 2026-10-02:
                             true pose AT THE MESSAGE'S STAMP (not the newest truth: a 10 ms
                             mismatch would look like 1.5 cm of error at 1.5 m/s)
   tr_vx, tr_vy              true body velocities (simulator twist) at that stamp
-  tr_r                      true yaw rate = the simulator's yaw-rate state (twist.angular.z)
-                            of that truth sample, 0 while the car stands (< 0.05 m/s; the
-                            state has been seen stuck after stops). Until 2026-10-02 it was
-                            the heading change over +-20 ms: that counts 3, 4 or 5 physics
-                            steps of 10 ms depending on timing (error p95 0.034 rad/s,
-                            job 023); twist.angular.z matches the real rotation per physics
-                            step within 0.01 rad/s rms.
+  tr_r                      true yaw rate of the gyro reading the message was made from:
+                            /sim/imu_ideal z (fake_imu publishes, for every reading, the same
+                            stamp + the noise- and bias-free yaw rate it used) -> se_r - tr_r
+                            = gyro noise + bias-estimate error, exactly. Fallback if that
+                            reading is missing: the yaw-rate state (twist.angular.z) of the
+                            newest NEW physics state first published >= STATE_DELIVERY_NS
+                            (1 ms) before the stamp. 0 while the car stands (< 0.05 m/s; the
+                            state has been seen stuck after stops). How many rows used which
+                            source is in the log.
+                            Why not the truth message nearest to the stamp (used 2026-10-02
+                            .. 10-03): the simulator's yaw rate JUMPS at every 10 ms physics
+                            step (its steering actuator moves the wheels at full speed,
+                            3.2 rad/s, until within 1e-4 rad of the target -> on straights
+                            they flick by 0.032 rad every step), and the nearest message can
+                            already carry the NEXT state, which the gyro has not seen yet.
+                            fake_imu's 100 Hz timer keeps a fixed phase to the physics steps
+                            for long stretches, so this "error" was 0.07 rad/s p95 in some
+                            runs and 0.01 (= the gyro noise) in others (jobs 047-048); even
+                            "the state published >= 1 ms before" is ambiguous when a reading
+                            falls 0-2 ms after a new state (job 048 run 1: p95 0.019).
+                            Before 2026-10-02: the heading change over +-20 ms (counts 3, 4 or
+                            5 physics steps, p95 0.034 rad/s, job 023).
+                            (Positions still use the nearest message: half a physics step =
+                            0.75 cm at 1.5 m/s; at racing speed interpolate instead.)
 File: ~/eval_logs/<run_name>_<YYYYmmdd_HHMMSS>.csv  (plot with plot_eval.py)
 """
 import math
@@ -37,7 +54,7 @@ import time
 from collections import deque
 
 import rclpy
-from geometry_msgs.msg import PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped, Vector3Stamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.time import Time
@@ -52,6 +69,7 @@ SE_COLS = ['se_s', 'se_ey', 'se_epsi', 'se_vx', 'se_vy', 'se_r', 'se_std_ey', 's
            'tr_s', 'tr_ey', 'tr_epsi', 'tr_vx', 'tr_vy', 'tr_r', 'tr_kappa']
 COLS = ['t', 's', 'tx', 'ty', 'tyaw', 'ex', 'ey', 'eyaw', 'e_sig', 'e_sig_yaw',
         'wx', 'wy', 'wyaw', 'a_err', 'a_err_yaw', 'k', 'bias', 'true_bias', 'v'] + SE_COLS
+STATE_DELIVERY_NS = 1_000_000    # a physics state reaches fake_imu ~0.7 ms after it is published
 
 
 def yaw_from_quat(q):
@@ -81,6 +99,10 @@ class EvalLogger(Node):
 
         self.truth = None
         self.truth_hist = deque(maxlen=1500)         # (t_ns, x, y, yaw, vx, vy, wz), a few s
+        self.state_hist = deque(maxlen=600)          # (first stamp ns, wz) of each NEW physics state
+        self.ideal = {}                              # gyro reading stamp [us] -> its true yaw rate
+        self.ideal_keys = deque()                    # same keys, oldest first (keep ~3 s)
+        self.r_src = {'reading': 0, 'state': 0, 'standing': 0}   # source of tr_r per row
         self.last_xy = None
         self.s = 0.0
         self.ekf = None
@@ -106,6 +128,7 @@ class EvalLogger(Node):
         self.create_subscription(StateEstimate, '/state_estimate', self.se_cb, 50)
         self.create_subscription(Float64, '/sim/true_gyro_bias',
                                  lambda m: setattr(self, 'true_bias', m.data), 10)
+        self.create_subscription(Vector3Stamped, '/sim/imu_ideal', self.ideal_cb, 50)
         self.create_timer(1.0 / self.get_parameter('rate_hz').value, self.write_row)
         self.create_timer(10.0, self.report)
         self.get_logger().info(f'Logging to {self.path}')
@@ -113,15 +136,17 @@ class EvalLogger(Node):
     def truth_cb(self, msg):
         pp = msg.pose.pose
         x, y = pp.position.x, pp.position.y
+        t_ns = Time.from_msg(msg.header.stamp).nanoseconds
+        tw = msg.twist.twist
+        if (x, y) != self.last_xy:                   # a NEW physics state (re-sends repeat it)
+            self.state_hist.append((t_ns, tw.angular.z))
         if self.last_xy is not None:
             step = math.hypot(x - self.last_xy[0], y - self.last_xy[1])
             if step < 0.5:                           # ignore teleports
                 self.s += step
         self.last_xy = (x, y)
         self.truth = msg
-        tw = msg.twist.twist
-        self.truth_hist.append((Time.from_msg(msg.header.stamp).nanoseconds,
-                                x, y, yaw_from_quat(pp.orientation), tw.linear.x, tw.linear.y,
+        self.truth_hist.append((t_ns, x, y, yaw_from_quat(pp.orientation), tw.linear.x, tw.linear.y,
                                 tw.angular.z))
 
     def amcl_cb(self, msg):
@@ -137,10 +162,35 @@ class EvalLogger(Node):
         self.se = msg
         self.se_rx_ns = self.get_clock().now().nanoseconds
 
-    def truth_at(self, t_ns):
-        """Truth sample nearest to t_ns, and the true yaw rate of that sample."""
+    def ideal_cb(self, msg):
+        """fake_imu: the noise/bias-free yaw rate of the reading with this stamp (sim only)."""
+        key = Time.from_msg(msg.header.stamp).nanoseconds // 1000     # = StateEstimate stamp_us
+        self.ideal[key] = msg.vector.z
+        self.ideal_keys.append(key)
+        while len(self.ideal_keys) > 300:
+            self.ideal.pop(self.ideal_keys.popleft(), None)
+
+    def rate_at(self, t_ns):
+        """True yaw rate the simulated gyro could have seen at t_ns: the yaw-rate state of the
+        newest physics state first published at least STATE_DELIVERY_NS before t_ns."""
+        limit = t_ns - STATE_DELIVERY_NS
+        for t_state, wz in reversed(self.state_hist):    # newest first; usually 1-2 steps back
+            if t_state <= limit:
+                return wz
+        return float('nan')
+
+    def truth_at(self, t_us):
+        """Truth sample nearest to the stamp (positions), and the true yaw rate at the stamp:
+        the gyro reading's own true rate if fake_imu sent it, else the physics state's."""
+        t_ns = t_us * 1000
         near = min(self.truth_hist, key=lambda e: abs(e[0] - t_ns))
-        r = 0.0 if math.hypot(near[4], near[5]) < 0.05 else near[6]    # standing car: 0
+        if math.hypot(near[4], near[5]) < 0.05:
+            src, r = 'standing', 0.0                                    # standing car: 0
+        elif t_us in self.ideal:
+            src, r = 'reading', self.ideal[t_us]
+        else:
+            src, r = 'state', self.rate_at(t_ns)
+        self.r_src[src] += 1
         return near, r
 
     def se_columns(self):
@@ -148,8 +198,7 @@ class EvalLogger(Node):
         if self.se is None or not self.truth_hist:
             return [nan] * len(SE_COLS)
         m = self.se
-        t_ns = m.stamp_us * 1000
-        (_, tx, ty, tyaw, tvx, tvy, _), tr_r = self.truth_at(t_ns)
+        (_, tx, ty, tyaw, tvx, tvy, _), tr_r = self.truth_at(m.stamp_us)
         tr_s, s_tr, tr_ey, tr_epsi, tr_k = self.track.project(tx, ty, tyaw)
         if self.track_first and s_tr > self.track.L - 2.0:   # same rule as the node:
             self.track.lap = -1                              # started just behind the line
@@ -189,7 +238,10 @@ class EvalLogger(Node):
             self.f.flush()
 
     def report(self):
-        self.get_logger().info(f'{self.rows} rows, {self.s:.1f} m driven -> {self.path}')
+        c = self.r_src
+        self.get_logger().info(f'{self.rows} rows, {self.s:.1f} m driven -> {self.path} | true yaw rate '
+                               f'from the gyro reading {c["reading"]}, from the physics state '
+                               f'{c["state"]}, standing {c["standing"]}')
 
     def destroy_node(self):
         self.f.flush()

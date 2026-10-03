@@ -41,6 +41,16 @@ SIMULATOR TIMING CHECK (every 5 s in the log, both models): this node sees every
 simulator message, so it counts the new physics states while the car moves and
 the longest gap between two of them; a gap > stall_s = the simulator stalled.
 A run with stalls is not a clean real-time run.
+
+EVALUATION SIDE CHANNEL /sim/imu_ideal (geometry_msgs/Vector3Stamped, added 2026-10-03):
+for every reading, the SAME stamp and the noise- and bias-free values it was made from
+(z = yaw rate, x = forward accel, y = sideways accel). eval_logger uses z as the true yaw
+rate of that reading. Why: the simulator's yaw rate jumps at every 10 ms physics step
+(its steering actuator flicks the wheels by +-0.032 rad per step), and from the outside
+one cannot tell reliably whether a reading taken 0-2 ms after a new state was published
+already used that state (job 048) -> any "truth at the stamp" picked from
+/ego_racecar/odom made the r error a lottery of timer phases. Simulation only, like
+/sim/true_gyro_bias.
 """
 import math
 import random
@@ -89,6 +99,7 @@ def ideal_imu(v, v_prev, yaw_rate, dt):
 
 try:
     import rclpy
+    from geometry_msgs.msg import Vector3Stamped
     from nav_msgs.msg import Odometry
     from rclpy.node import Node
     from sensor_msgs.msg import Imu
@@ -147,6 +158,7 @@ class FakeImu(Node):
         self.pub = self.create_publisher(Imu, '/imu/data', 50)
         # Simulation truth, ONLY for judging the EKF (a real IMU can't tell you this)
         self.bias_pub = self.create_publisher(Float64, '/sim/true_gyro_bias', 10)
+        self.ideal_pub = self.create_publisher(Vector3Stamped, '/sim/imu_ideal', 50)
         self.create_timer(self.dt, self.publish)
         self.create_timer(5.0, self.report)
         self.get_logger().info('Publishing simulated IMU on /imu/data '
@@ -217,6 +229,10 @@ class FakeImu(Node):
 
         self.pub.publish(msg)
         self.bias_pub.publish(Float64(data=bias))
+        ideal = Vector3Stamped()                    # what this reading was made from (evaluation)
+        ideal.header = msg.header
+        ideal.vector.x, ideal.vector.y, ideal.vector.z = self.ax_filtered, ay, wz
+        self.ideal_pub.publish(ideal)
 
     def report(self):
         b = self.gyro_bias.value
