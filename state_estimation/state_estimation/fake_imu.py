@@ -6,10 +6,21 @@ node builds one from the ground truth and adds the errors a cheap MEMS IMU
 (MPU-6050 / ICM-20948 class) really has:
 
   gyro_z  = true_yaw_rate + bias(t) + white noise
-            (true_yaw_rate = how far the TRUE POSE rotated since the last
-             reading / dt. The simulator's own twist.angular.z is NOT used:
-             it can stay stuck at a non-zero value after the car stops,
-             which a real gyro would never report -- see check_sim_yawrate.py)
+            true_yaw_rate, parameter `model`:
+              v1 = how far the TRUE POSE rotated since the last reading / dt.
+                   Exact in total, but the 10 ms reading timer slides against the
+                   simulator's 10 ms physics timer: in turns ~80 % of the readings
+                   see 0 or 2 physics steps (0x / 2x the true rate).
+              v3 = pause_proof.PauseProofRate (2026-10-03): the simulator's own
+                   yaw-rate state, scaled by how fast the simulator really
+                   progresses, plus a slow correction that keeps the reported
+                   rotation equal to the pose's rotation -> smooth AND it never
+                   reports rotation the simulated car did not make (the simulator
+                   falls behind / pauses when the laptop is busy). Offline test on
+                   recorded data: rate error rms 0.003 rad/s (v1: 0.27-0.30),
+                   heading off by 0.00 deg after injected freezes.
+              (The simulator's yaw-rate state alone = "v2": smooth, but it kept
+               reporting rotation during simulator pauses -> rejected 2026-10-02.)
   accel_x = dv/dt          + bias    + white noise   (forward acceleration)
   accel_y = v * yaw_rate   + bias    + white noise   (centripetal acceleration)
   accel_z = +9.81          + noise                   (gravity; car is flat)
@@ -25,6 +36,11 @@ the IMU driver publishing the same topic.
 
 Orientation is NOT provided (a 6-axis IMU can't measure absolute yaw), so
 orientation_covariance[0] = -1, the ROS convention for "no orientation".
+
+SIMULATOR TIMING CHECK (every 5 s in the log, both models): this node sees every
+simulator message, so it counts the new physics states while the car moves and
+the longest gap between two of them; a gap > stall_s = the simulator stalled.
+A run with stalls is not a clean real-time run.
 """
 import math
 import random
@@ -77,6 +93,8 @@ try:
     from rclpy.node import Node
     from sensor_msgs.msg import Imu
     from std_msgs.msg import Float64
+
+    from state_estimation.pause_proof import PauseProofRate
 except ImportError:
     Node = object
 
@@ -97,6 +115,11 @@ class FakeImu(Node):
         self.declare_parameter('accel_smoothing', 0.2)     # low-pass on dv/dt, 0..1
         self.declare_parameter('frame_id', 'ego_racecar/base_link')
         self.declare_parameter('max_yaw_rate', 10.0)       # rad/s; faster = teleport, ignored
+        # True yaw rate: 'v1' = pose difference per reading, 'v3' = PauseProofRate (see docstring)
+        self.declare_parameter('model', 'v3')
+        self.declare_parameter('sim_step_s', 0.01)         # simulator physics step
+        self.declare_parameter('stall_s', 0.025)           # no new state for longer = stalled
+        self.declare_parameter('track_tau_s', 0.2)         # v3: correction time constant
 
         p = lambda n: self.get_parameter(n).value  # noqa: E731
         self.gyro_bias = RandomWalkBias(p('gyro_bias'), p('gyro_bias_walk'))
@@ -107,6 +130,18 @@ class FakeImu(Node):
         self.prev_speed = 0.0
         self.ax_filtered = 0.0
         self.dt = 1.0 / p('rate_hz')
+        self.model = str(p('model')).strip().lower()
+        if self.model not in ('v1', 'v3'):
+            raise ValueError(f"model must be 'v1' or 'v3', not {self.model!r}")
+        self.rate_model = PauseProofRate(step_s=p('sim_step_s'), hold_s=p('stall_s'),
+                                         tau_s=p('track_tau_s'), angle=True,
+                                         max_jump=0.1 * p('max_yaw_rate'))
+        # simulator timing check (new physics states while moving)
+        self.last_pose = None
+        self.t_last_state = None
+        self.speed_last_state = 0.0
+        self.win = {'states': 0, 'max_gap': 0.0, 'stalls': 0}
+        self.run_stalls, self.run_max_gap = 0, 0.0
 
         self.create_subscription(Odometry, '/ego_racecar/odom', self.odom_cb, 10)
         self.pub = self.create_publisher(Imu, '/imu/data', 50)
@@ -115,13 +150,28 @@ class FakeImu(Node):
         self.create_timer(self.dt, self.publish)
         self.create_timer(5.0, self.report)
         self.get_logger().info('Publishing simulated IMU on /imu/data '
-                               f'(start gyro bias {p("gyro_bias"):.3f} rad/s)')
+                               f'(start gyro bias {p("gyro_bias"):.3f} rad/s, yaw-rate model {self.model})')
 
     def odom_cb(self, msg):
         vx = msg.twist.twist.linear.x
         vy = msg.twist.twist.linear.y
         self.true_speed = math.copysign(math.hypot(vx, vy), vx)
         self.true_yaw = yaw_from_quat(msg.pose.pose.orientation)
+        # A NEW physics state? (the simulator re-sends its newest state every 4 ms)
+        pose = (msg.pose.pose.position.x, msg.pose.pose.position.y, self.true_yaw)
+        if pose == self.last_pose:
+            return
+        self.last_pose = pose
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if self.t_last_state is not None and abs(self.speed_last_state) > 0.05:
+            gap = now - self.t_last_state
+            self.win['states'] += 1
+            self.win['max_gap'] = max(self.win['max_gap'], gap)
+            if gap > self.get_parameter('stall_s').value:
+                self.win['stalls'] += 1
+        self.t_last_state, self.speed_last_state = now, self.true_speed
+        if self.model == 'v3':
+            self.rate_model.on_state(now, self.true_yaw, msg.twist.twist.angular.z)
 
     def publish(self):
         p = lambda n: self.get_parameter(n).value  # noqa: E731
@@ -130,9 +180,13 @@ class FakeImu(Node):
         now = self.get_clock().now()
         if self.last_pub_time is None:
             self.last_pub_time, self.yaw_at_last_pub = now, self.true_yaw
+            self.rate_model.sample(now.nanoseconds * 1e-9)     # starts its clock
             return
         dt = (now - self.last_pub_time).nanoseconds * 1e-9
-        true_rate = pose_yaw_rate(self.true_yaw, self.yaw_at_last_pub, dt, p('max_yaw_rate'))
+        if self.model == 'v3':
+            true_rate = self.rate_model.sample(now.nanoseconds * 1e-9)
+        else:
+            true_rate = pose_yaw_rate(self.true_yaw, self.yaw_at_last_pub, dt, p('max_yaw_rate'))
         self.last_pub_time, self.yaw_at_last_pub = now, self.true_yaw
 
         ax, ay, az, wz = ideal_imu(self.true_speed, self.prev_speed, true_rate, self.dt)
@@ -166,7 +220,14 @@ class FakeImu(Node):
 
     def report(self):
         b = self.gyro_bias.value
-        self.get_logger().info(f'true gyro bias now {b:+.4f} rad/s ({math.degrees(b):+.2f} deg/s)')
+        w, stall = self.win, self.get_parameter('stall_s').value
+        self.run_stalls += w['stalls']
+        self.run_max_gap = max(self.run_max_gap, w['max_gap'])
+        sim = (f"sim while moving: {w['states']} new states in 5 s, longest gap {w['max_gap'] * 1000:.0f} ms, "
+               f"stalls > {stall * 1000:.0f} ms: {w['stalls']} (run: {self.run_stalls}, "
+               f"longest {self.run_max_gap * 1000:.0f} ms)") if w['states'] else 'sim: car not moving'
+        self.get_logger().info(f'true gyro bias now {b:+.4f} rad/s ({math.degrees(b):+.2f} deg/s) | {sim}')
+        self.win = {'states': 0, 'max_gap': 0.0, 'stalls': 0}
 
 
 def main(args=None):

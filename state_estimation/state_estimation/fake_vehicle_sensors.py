@@ -8,6 +8,14 @@ them from the simulator's ground truth and adds realistic errors:
   speed    = true_speed * (1 + speed_scale_error) + noise
   steering = commanded_steering + steering_bias + noise
 
+true_speed, parameter `model`:
+  v1 = the simulator's speed state. In a simulator pause (busy laptop) it keeps
+       reporting speed while the simulated car stands -> the EKF drives on
+       (offline test: 92-95 cm of phantom distance after injected freezes).
+  v3 = pause_proof.PauseProofRate on the DISTANCE travelled (from the poses): the
+       speed state scaled by the simulator's real progress, plus a slow correction
+       that keeps the reported distance equal to the real one (offline: 0.00 cm).
+
 Output: /vehicle/measured (ackermann_msgs/AckermannDriveStamped) at 50 Hz.
 On the real car this node is replaced by the STM32 bridge publishing the
 same topic, so everything downstream stays the same.
@@ -21,6 +29,8 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 
+from state_estimation.pause_proof import PauseProofRate
+
 
 class FakeVehicleSensors(Node):
 
@@ -33,21 +43,47 @@ class FakeVehicleSensors(Node):
         self.declare_parameter('steering_noise', 0.005)    # rad
         self.declare_parameter('teleop_steer', 0.3)        # rad, what the sim uses for /cmd_vel
         self.declare_parameter('max_steer', 0.4189)        # rad, sim steering limit
+        # True speed: 'v1' = simulator speed state, 'v3' = PauseProofRate (see docstring)
+        self.declare_parameter('model', 'v3')
+        self.declare_parameter('sim_step_s', 0.01)
+        self.declare_parameter('stall_s', 0.025)
+        self.declare_parameter('track_tau_s', 0.2)
 
+        p = lambda n: self.get_parameter(n).value  # noqa: E731
         self.true_speed = 0.0
         self.cmd_steer = 0.0
+        self.model = str(p('model')).strip().lower()
+        if self.model not in ('v1', 'v3'):
+            raise ValueError(f"model must be 'v1' or 'v3', not {self.model!r}")
+        self.speed_model = PauseProofRate(step_s=p('sim_step_s'), hold_s=p('stall_s'),
+                                          tau_s=p('track_tau_s'), angle=False, max_jump=0.5)
+        self.last_xy = None
+        self.distance = 0.0              # travelled along the path, signed by the direction
 
         self.create_subscription(Odometry, '/ego_racecar/odom', self.odom_cb, 10)
         self.create_subscription(Twist, '/cmd_vel', self.teleop_cb, 10)
         self.create_subscription(AckermannDriveStamped, '/drive', self.drive_cb, 10)
         self.pub = self.create_publisher(AckermannDriveStamped, '/vehicle/measured', 10)
         self.create_timer(1.0 / self.get_parameter('rate_hz').value, self.publish)
-        self.get_logger().info('Publishing simulated wheel speed + steering on /vehicle/measured')
+        self.get_logger().info('Publishing simulated wheel speed + steering on /vehicle/measured '
+                               f'(speed model {self.model})')
 
     def odom_cb(self, msg):
         vx = msg.twist.twist.linear.x
         vy = msg.twist.twist.linear.y
         self.true_speed = math.copysign(math.hypot(vx, vy), vx)
+        if self.model != 'v3':
+            return
+        q = msg.pose.pose.orientation
+        xy = (msg.pose.pose.position.x, msg.pose.pose.position.y, q.z, q.w)
+        if xy == self.last_xy:
+            return                       # the simulator re-sends its newest state every 4 ms
+        if self.last_xy is not None:
+            step = math.hypot(xy[0] - self.last_xy[0], xy[1] - self.last_xy[1])
+            self.distance += step if self.true_speed >= 0.0 else -step
+        self.last_xy = xy
+        self.speed_model.on_state(self.get_clock().now().nanoseconds * 1e-9,
+                                  self.distance, self.true_speed)
 
     def teleop_cb(self, msg):
         # Same rule the simulator bridge uses for keyboard teleop
@@ -61,10 +97,13 @@ class FakeVehicleSensors(Node):
     def publish(self):
         p = lambda n: self.get_parameter(n).value  # noqa: E731
         out = AckermannDriveStamped()
-        out.header.stamp = self.get_clock().now().to_msg()
+        now = self.get_clock().now()
+        out.header.stamp = now.to_msg()
         out.header.frame_id = 'ego_racecar/base_link'
-        speed = self.true_speed * (1.0 + p('speed_scale_error'))
-        if abs(self.true_speed) > 1e-3:          # a stopped wheel reads zero
+        true_speed = (self.speed_model.sample(now.nanoseconds * 1e-9) if self.model == 'v3'
+                      else self.true_speed)
+        speed = true_speed * (1.0 + p('speed_scale_error'))
+        if abs(true_speed) > 1e-3:               # a stopped wheel reads zero
             speed += random.gauss(0.0, p('speed_noise'))
         out.drive.speed = speed
         out.drive.steering_angle = (self.cmd_steer + p('steering_bias')
