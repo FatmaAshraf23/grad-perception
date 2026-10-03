@@ -75,9 +75,18 @@ UPDATE 2 -- AMCL pose (global EKF only)                       NEW in v3
 
 Topics
   in : /imu/data, /vehicle/measured, /amcl_pose (global), /initialpose (global)
-       /ego_racecar/odom (simulation truth, report only)
-  out: <odom_topic>, <path_topic>, <diag_prefix>/bias, /bias_sigma,
-       /speed_scale, /nis ; TF odom -> est/base_link (local only)
+       <truth_topic> (global, simulation truth for the 2-s report only;
+                      default 'none' = off -- the real car has no truth)
+  out: <odom_topic>, <path_topic> (only if path_period_s > 0; for viewing),
+       <diag_prefix>/bias, /bias_sigma, /speed_scale, /nis ;
+       TF odom -> est/base_link (local only)
+
+CPU (2026-10-03): in Python ROS 2 the cost is mostly MESSAGES, not math. The sim
+truth arrives at 250 Hz, and the path message carries up to path_max_len poses;
+both are off by default so nothing sim-only or view-only runs on the Pi.
+state_pipeline.py runs both EKFs + state_estimate in ONE process: one IMU and one
+wheel subscription for all three; odom_hooks / fix_hooks hand ekf_global's output
+to state_estimate without a message.
 """
 import math
 import os
@@ -256,8 +265,10 @@ def yaw_from_quat(q):
 
 class EkfNode(Node):
 
-    def __init__(self):
-        super().__init__('ekf_node')
+    def __init__(self, node_name='ekf_node', own_inputs=True):
+        # node_name / own_inputs=False: used by state_pipeline.py (both EKFs + state_estimate
+        # in ONE process, the IMU and wheel messages arrive through ONE shared subscription)
+        super().__init__(node_name)
         d = self.declare_parameter
         d('mode', 'map')                    # 'map' = global EKF, 'odom' = local EKF
         d('frame_id', 'map')                # frame of the estimated pose
@@ -267,6 +278,8 @@ class EkfNode(Node):
         d('path_topic', '/odom/ekf_path')
         d('diag_prefix', '/ekf')
         d('path_max_len', 1500)             # poses kept in the path (5 per s -> 5 min)
+        d('path_period_s', 0.0)             # s between path messages; 0 = no path (default)
+        d('truth_topic', 'none')            # sim truth for the report; 'none' = off (real car)
         d('diag_every', 10)                 # publish bias/scale every Nth IMU step (10 Hz)
         # Start pose and its uncertainty
         d('x0', 0.0); d('y0', 0.0); d('yaw0', 0.0)
@@ -335,12 +348,19 @@ class EkfNode(Node):
         self.path.header.frame_id = p('frame_id')
         self.tf_pub = TransformBroadcaster(self) if p('publish_tf') else None
 
-        self.create_subscription(Imu, '/imu/data', self.imu_cb, 100)
-        self.create_subscription(AckermannDriveStamped, '/vehicle/measured', self.meas_cb, 50)
+        # In-process consumers (state_pipeline): called with every published odometry and with
+        # the NIS message of every ACCEPTED AMCL fix -- the same data the topics carry.
+        self.odom_hooks = []
+        self.fix_hooks = []
+        if own_inputs:
+            self.create_subscription(Imu, '/imu/data', self.imu_cb, 100)
+            self.create_subscription(AckermannDriveStamped, '/vehicle/measured', self.meas_cb, 50)
         if self.global_mode:
             self.create_subscription(PoseWithCovarianceStamped, p('amcl_topic'), self.amcl_cb, 10)
             self.create_subscription(PoseWithCovarianceStamped, '/initialpose', self.reset_cb, 10)
-            self.create_subscription(Odometry, '/ego_racecar/odom', self.truth_cb, 10)
+            tt = str(p('truth_topic')).strip()
+            if tt and tt.lower() != 'none':
+                self.create_subscription(Odometry, tt, self.truth_cb, 10)
         self.odom_pub = self.create_publisher(Odometry, p('odom_topic'), 10)
         self.path_pub = self.create_publisher(Path, p('path_topic'), 10)
         pre = p('diag_prefix')
@@ -348,7 +368,8 @@ class EkfNode(Node):
         self.bias_sigma_pub = self.create_publisher(Float64, pre + '/bias_sigma', 10)
         self.scale_pub = self.create_publisher(Float64, pre + '/speed_scale', 10)
         self.nis_pub = self.create_publisher(Float64, pre + '/nis', 10)
-        self.create_timer(0.2, self.publish_path)
+        if p('path_period_s') > 0.0:
+            self.create_timer(p('path_period_s'), self.publish_path)
         self.create_timer(2.0, self.report)
         if self.global_mode and self.learned_file:
             self.create_timer(10.0, self.save_scale)
@@ -490,7 +511,10 @@ class EkfNode(Node):
         self.history.shift(dx)
         self.stats['acc'] += 1
         self.stats['nis'] += nis
-        self.nis_pub.publish(Float64(data=nis))
+        nis_msg = Float64(data=nis)
+        self.nis_pub.publish(nis_msg)
+        for hook in self.fix_hooks:
+            hook(nis_msg)
 
     def reset_cb(self, msg):
         pose = msg.pose.pose
@@ -536,6 +560,8 @@ class EkfNode(Node):
         odom.twist.twist.linear.x = k * self.v
         odom.twist.twist.angular.z = float(w_m) - b
         self.odom_pub.publish(odom)
+        for hook in self.odom_hooks:
+            hook(odom)
         self.imu_count += 1
         if self.imu_count % self.get_parameter('diag_every').value == 0:
             self.bias_pub.publish(Float64(data=b))
