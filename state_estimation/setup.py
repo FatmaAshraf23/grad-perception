@@ -35,6 +35,7 @@ setup(
             'wheel_calib = state_estimation.wheel_calib:main',
             'state_estimate = state_estimation.state_estimate_node:main',
             'state_pipeline = state_estimation.state_pipeline:main',
+            'lifecycle_activator = state_estimation.lifecycle_activator:main',
         ],
     },
 )
