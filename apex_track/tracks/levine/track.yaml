@@ -5,3 +5,4 @@ track_id: levine
 centerline: centerline.csv
 smooth_m: 0.5      # OPEN: 0.5 vs 1.0 still to agree with control (see progress log)
 ds: 0.05
+boundaries: boundaries.csv   # wall distances left/right (python3 -m apex_track.boundaries, 2026-10-05)

@@ -101,6 +101,8 @@ class FrenetTrack:
         self.s_prev = None           # s in [0, L) of the last call
         self.lap = 0
         self.reseeded = False        # did the LAST project() call need a global search?
+        self.w_left = self.w_right = None          # boundaries (set_boundaries / load_track)
+        self.left_virtual = self.right_virtual = None
 
     @classmethod
     def from_csv(cls, path, **kw):
@@ -221,3 +223,64 @@ class FrenetTrack:
         f = np.where(upper, t - 0.5, t + 0.5)
         k = (1 - f) * self.kappa_seg[a] + f * self.kappa_seg[b]
         return float(k[0]) if np.ndim(s) == 0 else k
+
+    # --- boundaries (optional, from tracks/<name>/boundaries.csv) --------------
+
+    @property
+    def has_boundaries(self):
+        return self.w_left is not None
+
+    def set_boundaries(self, w_left, w_right, left_virtual=None, right_virtual=None):
+        """Wall distances at every centre-line point (self.s0). Normally done by load_track()."""
+        w_left, w_right = np.asarray(w_left, float), np.asarray(w_right, float)
+        if w_left.shape != (self.n,) or w_right.shape != (self.n,):
+            raise ValueError(f'need {self.n} widths per side, got {w_left.shape} / {w_right.shape}')
+        self.w_left, self.w_right = w_left, w_right
+        z = np.zeros(self.n, dtype=bool)
+        self.left_virtual = z if left_virtual is None else np.asarray(left_virtual, bool)
+        self.right_virtual = z.copy() if right_virtual is None else np.asarray(right_virtual, bool)
+
+    def width_at(self, s, d_min=0.1):
+        """(w_left, w_right) [m] at s: distance from the centre line to the left / right wall.
+
+        The drivable corridor is  -w_right <= e_y <= w_left.  Any s (wraps, so
+        s_abs works); one number or a numpy array (a whole planning horizon).
+        Linear interpolation between the 5 cm points.
+            room_left  = w_left  - e_y      (from the StateEstimate's s, e_y)
+            room_right = w_right + e_y
+
+        d_min: Frenet validity limit on the INSIDE of a corner. The normals of
+        a curve with radius R = 1/|kappa| all cross at its centre, R away from
+        the centre line; beyond that point e_y no longer describes a unique
+        place and the Frenet dynamics divide by D = 1 - kappa*e_y <= 0. So on
+        the inner side the width is cut to  (1 - d_min) / |kappa|  (keeps
+        D >= d_min). Default 0.1 (corridor up to 90 % of the way to the
+        centre). d_min=None -> the raw wall distance from the map.
+        """
+        if not self.has_boundaries:
+            raise RuntimeError('this track has no boundaries (track.yaml: boundaries: boundaries.csv)')
+        s_arr = np.atleast_1d(np.asarray(s, dtype=float)) % self.L
+        i = np.clip(np.searchsorted(self.s0, s_arr, side='right') - 1, 0, self.n - 1)
+        f = (s_arr - self.s0[i]) / self.seg_len[i]
+        j = (i + 1) % self.n
+        wl = (1 - f) * self.w_left[i] + f * self.w_left[j]
+        wr = (1 - f) * self.w_right[i] + f * self.w_right[j]
+        if d_min is not None:
+            k = self.kappa_at(s_arr)
+            lim = (1.0 - d_min) / np.maximum(np.abs(k), 1e-9)
+            wl = np.where(k > 0, np.minimum(wl, lim), wl)        # left turn: left side is inside
+            wr = np.where(k < 0, np.minimum(wr, lim), wr)
+        if np.ndim(s) == 0:
+            return float(wl[0]), float(wr[0])
+        return wl, wr
+
+    def boundaries_xy(self, d_min=None):
+        """(left_xy, right_xy): the two walls as closed polylines in the map frame, (n, 2) each,
+        one point per centre-line point (for plots, raceline optimisation, an RViz marker).
+        d_min=None -> the raw walls; a number -> the Frenet-valid corridor (see width_at)."""
+        wl, wr = self.width_at(self.s0, d_min=d_min)
+        th = np.array([self._at(i, 0.0)[0] for i in range(self.n)])
+        nx, ny = -np.sin(th), np.cos(th)
+        left = np.column_stack([self.p[:, 0] + wl * nx, self.p[:, 1] + wl * ny])
+        right = np.column_stack([self.p[:, 0] - wr * nx, self.p[:, 1] - wr * ny])
+        return left, right

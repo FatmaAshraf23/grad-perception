@@ -9,10 +9,12 @@ no ROS needed (works on the Pi 4, in WSL, on Windows, in a notebook).
     track = load_track('tracks/levine/track.yaml')
     s_abs, s, e_y, e_psi, kappa = track.project(x, y, yaw)
     print(track.track_id, track.track_hash)
+    w_left, w_right = track.width_at(s)      # walls (if the track has boundaries.csv)
 """
 from .frenet import FrenetTrack, load_xy_csv, wrap
+from .boundary_io import compute_boundary_hash
 from .track import GEOMETRY_VERSION, compute_track_hash, load_track
 
 __all__ = ['FrenetTrack', 'load_xy_csv', 'wrap',
-           'GEOMETRY_VERSION', 'compute_track_hash', 'load_track']
-__version__ = '0.1.0'
+           'GEOMETRY_VERSION', 'compute_track_hash', 'compute_boundary_hash', 'load_track']
+__version__ = '0.2.0'
