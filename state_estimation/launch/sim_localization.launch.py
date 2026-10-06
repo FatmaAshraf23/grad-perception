@@ -36,6 +36,8 @@ sim_sensors (2026-10-03): model of the simulated gyro (fake_imu) and wheel speed
   simulator pause); v3 = pause_proof.PauseProofRate for both: smooth and pause-proof.
 steer_calib_file (2026-10-03): steering calibration written by steer_calib, read by both
   EKFs and state_estimate (default ~/.ros/steering_calibration.yaml; none = no correction).
+track (2026-10-06): apex_track track the StateEstimate projects onto (Frenet s, e_y, e_psi);
+  default levine. Must match the simulator's map (closed1 = the closed-corner test track).
 lifecycle (2026-10-03): who switches AMCL on. activator (default) = our lifecycle_activator,
   which re-reads AMCL's state and retries when a reply is lost; nav2 = nav2's lifecycle
   manager, which waited forever when its first reply was lost (jobs 040/041).
@@ -78,7 +80,7 @@ def _ekfs_and_state_estimate(context):
     yes = lambda n: arg(n).lower() in ('1', 'true', 'yes', 'on')      # noqa: E731
     common = {'path_period_s': float(arg('ekf_path_period')), 'scale_file': arg('scale_file'),
               'steer_calib_file': arg('steer_calib_file')}
-    se = {'steer_calib_file': arg('steer_calib_file')}
+    se = {'steer_calib_file': arg('steer_calib_file'), 'track': arg('track')}
     # LOCAL EKF: odometry for AMCL, starts at the origin of the odom frame
     local = dict(common, **{
         'mode': 'odom', 'frame_id': 'odom', 'child_frame_id': 'est/base_link',
@@ -158,6 +160,8 @@ def generate_launch_description():
         # steering calibration (steer_calib) for both EKFs + state_estimate; none = no correction
         DeclareLaunchArgument('steer_calib_file', default_value='~/.ros/steering_calibration.yaml'),
         DeclareLaunchArgument('activator_timeout', default_value='2.0'),
+        # apex_track track for the StateEstimate (2026-10-06): levine | closed1 | <our track>
+        DeclareLaunchArgument('track', default_value='levine'),
 
         # CPU rule: limit numpy's math-library threads for every node below
         SetEnvironmentVariable('OPENBLAS_NUM_THREADS', LaunchConfiguration('numpy_threads')),

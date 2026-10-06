@@ -12,7 +12,11 @@ default 0.10 since 2026-10-01), numpy_threads (BLAS threads per node, default 1)
 pipeline (separate = 3 processes, merged = ONE process for both EKFs + state_estimate),
 sim_sensors (v1 | v3: simulated gyro + wheel-speed model, see sim_localization),
 scale_file (speed-scale calibration;
-scale_file:=none = start uncalibrated with k = 1, the old behaviour).
+scale_file:=none = start uncalibrated with k = 1, the old behaviour),
+track (apex_track track for the StateEstimate AND the logger's true Frenet state, default levine)
+and waypoints (the test driver's path, '' = levine_centerline.csv) -- 2026-10-06, for other maps:
+    track:=closed1 waypoints:=$(ros2 pkg prefix apex_track)/share/apex_track/tracks/closed1/centerline.csv
+    (the simulator must run the same map: sim_perception.launch.py config:=<sim yaml with that map>)
 Do NOT run teleop at the same time (both would send drive commands).
 """
 import os
@@ -37,16 +41,19 @@ def generate_launch_description():
                           'ekf_truth_topic': LaunchConfiguration('ekf_truth_topic'),
                           'pipeline': LaunchConfiguration('pipeline'),
                           'sim_sensors': LaunchConfiguration('sim_sensors'),
-                          'steer_calib_file': LaunchConfiguration('steer_calib_file')}.items(),
+                          'steer_calib_file': LaunchConfiguration('steer_calib_file'),
+                          'track': LaunchConfiguration('track')}.items(),
     )
     driver = Node(
         package='state_estimation', executable='test_driver', name='test_driver', output='screen',
         parameters=[{'laps': ParameterValue(LaunchConfiguration('laps'), value_type=int),
-                     'v_max': ParameterValue(LaunchConfiguration('v_max'), value_type=float)}],
+                     'v_max': ParameterValue(LaunchConfiguration('v_max'), value_type=float),
+                     'waypoints': ParameterValue(LaunchConfiguration('waypoints'), value_type=str)}],
     )
     logger = Node(
         package='state_estimation', executable='eval_logger', name='eval_logger', output='screen',
-        parameters=[{'run_name': LaunchConfiguration('run_name')}],
+        parameters=[{'run_name': LaunchConfiguration('run_name'),
+                     'track': ParameterValue(LaunchConfiguration('track'), value_type=str)}],
     )
     return LaunchDescription([
         DeclareLaunchArgument('run_name', default_value='run'),
@@ -60,6 +67,8 @@ def generate_launch_description():
         DeclareLaunchArgument('pipeline', default_value='merged'),     # or separate (3 processes)
         DeclareLaunchArgument('sim_sensors', default_value='v3'),      # or v1 (old gyro + speed models)
         DeclareLaunchArgument('steer_calib_file', default_value='~/.ros/steering_calibration.yaml'),
+        DeclareLaunchArgument('track', default_value='levine'),         # apex_track track (2026-10-06)
+        DeclareLaunchArgument('waypoints', default_value=''),           # '' = levine_centerline.csv
         # CPU rule (also for test_driver and eval_logger, which start here)
         SetEnvironmentVariable('OPENBLAS_NUM_THREADS', LaunchConfiguration('numpy_threads')),
         SetEnvironmentVariable('OMP_NUM_THREADS', LaunchConfiguration('numpy_threads')),

@@ -1,0 +1,10 @@
+# APEX track definition -- load with apex_track.load_track()
+# SIMULATOR TEST TRACK (2026-10-06, made by sim/make_closed_track.py -- see sim/README.md): 1.6 m lane,
+# walls all around (no side corridors), corner radii 1.1 / 1.5 / 2.2 m, one right-hand corner, 14 m
+# featureless start/finish straight. Start/finish = first point (0, 0), 4 m into the start straight,
+# driving direction = +x (counter-clockwise loop). Not our real track -- its map is made in the simulator.
+track_id: closed1
+centerline: centerline.csv
+smooth_m: 0.5
+ds: 0.05
+boundaries: boundaries.csv   # wall distances left/right (python3 -m apex_track.boundaries, 2026-10-06)
