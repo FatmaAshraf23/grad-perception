@@ -17,6 +17,8 @@ track (apex_track track for the StateEstimate AND the logger's true Frenet state
 and waypoints (the test driver's path, '' = levine_centerline.csv) -- 2026-10-06, for other maps:
     track:=closed1 waypoints:=$(ros2 pkg prefix apex_track)/share/apex_track/tracks/closed1/centerline.csv
     (the simulator must run the same map: sim_perception.launch.py config:=<sim yaml with that map>)
+ekf_test_fault (TEST ONLY, 2026-10-06): 't_s,dx,dy,dyaw_deg' moves ekf_global's pose once -> tests
+the robust jump to AMCL; '' (default) = off.
 Do NOT run teleop at the same time (both would send drive commands).
 """
 import os
@@ -42,7 +44,8 @@ def generate_launch_description():
                           'pipeline': LaunchConfiguration('pipeline'),
                           'sim_sensors': LaunchConfiguration('sim_sensors'),
                           'steer_calib_file': LaunchConfiguration('steer_calib_file'),
-                          'track': LaunchConfiguration('track')}.items(),
+                          'track': LaunchConfiguration('track'),
+                          'ekf_test_fault': LaunchConfiguration('ekf_test_fault')}.items(),
     )
     driver = Node(
         package='state_estimation', executable='test_driver', name='test_driver', output='screen',
@@ -69,6 +72,7 @@ def generate_launch_description():
         DeclareLaunchArgument('steer_calib_file', default_value='~/.ros/steering_calibration.yaml'),
         DeclareLaunchArgument('track', default_value='levine'),         # apex_track track (2026-10-06)
         DeclareLaunchArgument('waypoints', default_value=''),           # '' = levine_centerline.csv
+        DeclareLaunchArgument('ekf_test_fault', default_value=''),      # TEST ONLY, see sim_localization
         # CPU rule (also for test_driver and eval_logger, which start here)
         SetEnvironmentVariable('OPENBLAS_NUM_THREADS', LaunchConfiguration('numpy_threads')),
         SetEnvironmentVariable('OMP_NUM_THREADS', LaunchConfiguration('numpy_threads')),

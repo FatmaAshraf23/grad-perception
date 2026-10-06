@@ -95,7 +95,8 @@ def _ekfs_and_state_estimate(context):
         'amcl_min_sigma_pos': float(arg('amcl_min_sigma_pos')),
         'x0': float(arg('x0')), 'y0': float(arg('y0')), 'yaw0': float(arg('yaw0')),
         'odom_topic': '/odom/ekf', 'path_topic': '/odom/ekf_path',
-        'diag_prefix': '/ekf', 'truth_topic': arg('ekf_truth_topic')})
+        'diag_prefix': '/ekf', 'truth_topic': arg('ekf_truth_topic'),
+        'test_fault': arg('ekf_test_fault')})
     with_se = yes('state_estimate')
     pipeline = arg('pipeline').lower()
 
@@ -162,6 +163,9 @@ def generate_launch_description():
         DeclareLaunchArgument('activator_timeout', default_value='2.0'),
         # apex_track track for the StateEstimate (2026-10-06): levine | closed1 | <our track>
         DeclareLaunchArgument('track', default_value='levine'),
+        # TEST ONLY (2026-10-06): 't_s,dx,dy,dyaw_deg' moves ekf_global's pose once, t_s s after its
+        # first IMU message -> tests the robust jump to AMCL (ekf_node RECOVERY). '' = off (always, normally)
+        DeclareLaunchArgument('ekf_test_fault', default_value=''),
 
         # CPU rule: limit numpy's math-library threads for every node below
         SetEnvironmentVariable('OPENBLAS_NUM_THREADS', LaunchConfiguration('numpy_threads')),

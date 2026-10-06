@@ -96,13 +96,41 @@ UPDATE 2 -- AMCL pose (global EKF only)                       NEW in v3
     parameter steer_calib_file; no file = no correction). A +0.01 rad steering
     offset made beta 0.30 deg too large and the heading 0.30 deg too low.
 
-    RECOVERY: if AMCL is rejected `reset_after_rejects` times in a row, the
-    EKF assumes it is the one that is lost (e.g. after a collision) and resets
-    its pose to AMCL's.
+    RECOVERY = JUMP TO AMCL, ONLY WHEN AMCL IS CLEARLY RIGHT (2026-10-06).
+    Before: after `reset_after_rejects` (10) AMCL poses rejected in a row the EKF
+    assumed IT was lost and jumped to AMCL. When AMCL was the one that was lost
+    (closed1 with a solid-black map, jobs 068-070) the EKF followed it into the
+    walls, 10-20 m off, and reported OK. Now:
+      1. AMCL poses with sqrt(cov_xx + cov_yy) > amcl_max_sigma (0.35 m) are
+         ignored -- AMCL itself says it is unsure (lost AMCL: > 0.2 m 99.9 % of
+         the time; normal laps: max 0.29 m).
+      2. After `reset_after_rejects` confident AMCL poses rejected in a row the
+         EKF jumps only if BOTH checks pass, otherwise it keeps going on odometry
+         (StateEstimate reports LOST after 1 s of driving without a fix):
+         a. AMCL MOVED LIKE THE ODOMETRY over those poses (motion_consistent:
+            first pose to every later one, each in its own frame, within
+            reset_tol_pos + reset_tol_frac * distance and reset_tol_yaw_deg);
+         b. THE LIDAR SCAN FITS THE MAP CLEARLY BETTER AT AMCL'S POSE than at
+            the EKF's (scan_fit: share of scan_beams beams whose measured range
+            matches the map's within scan_tol; AMCL >= reset_scan_min and
+            >= EKF + reset_scan_margin). (a) alone is not enough: a lost AMCL
+            moves with the odometry too.
+         Otherwise the oldest of the poses is dropped and the next one re-checks.
+    Offline (robust.py, recorded laps): AMCL lost (12 solid-map runs): old rule
+    52 jumps onto the wrong pose, EKF up to 23 m off -> new rule 0 jumps, EKF
+    error p95 0.24 m / max 0.34 m; EKF lost (40 injected faults, AMCL fine):
+    recovered in 1.4 s (up to ~6 s when the error lies along a featureless
+    corridor, where the scan looks the same); normal laps unchanged.
+    The scan check needs the map (map_topic) and the scan AMCL uses (scan_topic),
+    and where the LiDAR sits on the car (laser_x, laser_y, laser_yaw).
+    test_fault (TEST ONLY, default off): 't_s,dx,dy,dyaw_deg' moves ekf_global's
+    pose once, t_s seconds after its first IMU message -- a "kidnapped" EKF while
+    AMCL is fine, to test the jump live.
 
 Topics
   in : /imu/data, /vehicle/measured, /amcl_pose (global), /initialpose (global)
-       <map_topic> (global, read once: checks amcl_offset_m against the resolution)
+       <map_topic> (global, read once: checks amcl_offset_m against the resolution;
+                    the walls for the scan check), <scan_topic> (global, scan check)
        <truth_topic> (global, simulation truth for the 2-s report only;
                       default 'none' = off -- the real car has no truth)
   out: <odom_topic>, <path_topic> (only if path_period_s > 0; for viewing),
@@ -266,6 +294,90 @@ def amcl_measurement_noise(cov6x6, scale, min_sigma_pos, min_sigma_yaw):
 
 
 # ----------------------------------------------------------------------------
+# Jump-to-AMCL check: plain numpy, no ROS -> tested offline (see RECOVERY)
+# ----------------------------------------------------------------------------
+
+class WallMap:
+    """The walls of the map AMCL uses, for ray casting. ROS cell convention (map_server,
+    RViz, the simulator): cell (row, col) spans origin + [col, col + 1) * res in x and
+    origin + [row, row + 1) * res in y; row 0 = the BOTTOM row (OccupancyGrid order).
+    Unknown cells do not stop a ray (like the simulator)."""
+
+    def __init__(self, occupied, res, ox, oy):
+        self.occ = np.asarray(occupied, dtype=bool)
+        self.h, self.w = self.occ.shape
+        self.res, self.ox, self.oy = float(res), float(ox), float(oy)
+
+    @classmethod
+    def from_grid(cls, data, width, height, res, ox, oy, occupied_from=65):
+        """OccupancyGrid data: 0 free, 100 wall, -1 unknown."""
+        grid = np.asarray(data, dtype=np.int16).reshape(height, width)
+        return cls(grid >= occupied_from, res, ox, oy)
+
+    def ranges(self, lx, ly, beam_yaws, max_range):
+        """Distance from (lx, ly) to the first wall cell along each beam (half-cell
+        steps); inf = no wall within max_range."""
+        ts = np.arange(0.5 * self.res, max_range + 1e-9, 0.5 * self.res)
+        xs = lx + np.outer(np.cos(beam_yaws), ts)
+        ys = ly + np.outer(np.sin(beam_yaws), ts)
+        col = np.floor((xs - self.ox) / self.res).astype(np.int64)
+        row = np.floor((ys - self.oy) / self.res).astype(np.int64)
+        inside = (col >= 0) & (col < self.w) & (row >= 0) & (row < self.h)
+        hit = np.zeros(xs.shape, dtype=bool)
+        hit[inside] = self.occ[row[inside], col[inside]]
+        return np.where(hit.any(axis=1), ts[hit.argmax(axis=1)], np.inf)
+
+
+def scan_fit(wall_map, pose, laser, beam_angles, r_meas, max_range, tol):
+    """Share of the beams the map explains if the car is at `pose` (x, y, yaw of
+    base_link): measured and map range within `tol`, or both 'no return' (inf).
+    laser = (x, y, yaw) of the LiDAR on the car. 1.0 = the scan fits perfectly."""
+    x, y, yaw = pose[0], pose[1], pose[2]
+    c, s = math.cos(yaw), math.sin(yaw)
+    lx, ly = x + c * laser[0] - s * laser[1], y + s * laser[0] + c * laser[1]
+    r_exp = wall_map.ranges(lx, ly, yaw + laser[2] + np.asarray(beam_angles), max_range)
+    meas_far, exp_far = ~np.isfinite(r_meas), ~np.isfinite(r_exp)
+    both = ~meas_far & ~exp_far
+    close = np.zeros(len(r_exp), dtype=bool)
+    close[both] = np.abs(r_meas[both] - r_exp[both]) < tol
+    return float(np.mean(close | (meas_far & exp_far)))
+
+
+def scan_beams(ranges, angle_min, angle_increment, range_min, range_max, n_beams):
+    """n_beams evenly spread beams of a LaserScan: (measured ranges, inf = no valid
+    return; their angles in the LiDAR frame)."""
+    r_all = np.asarray(ranges, dtype=float)
+    idx = np.unique(np.linspace(0, len(r_all) - 1, n_beams).round().astype(np.int64))
+    r = r_all[idx]
+    r = np.where(np.isfinite(r) & (r >= range_min) & (r <= range_max), r, np.inf)
+    return r, angle_min + idx * angle_increment
+
+
+def body_motion(a, b):
+    """Motion from pose a to pose b in a's frame: (forward, left, turn)."""
+    c, s = math.cos(a[2]), math.sin(a[2])
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    return c * dx + s * dy, -s * dx + c * dy, wrap(b[2] - a[2])
+
+
+def motion_consistent(streak, tol_pos, tol_frac, tol_yaw):
+    """streak = [(t_ns, AMCL pose, EKF pose at that time), ...] of rejected AMCL poses
+    (the EKF accepted nothing meanwhile, so its motion = odometry). Did AMCL move the way
+    the odometry says the car moved? From the first pose to every later one, each in its
+    own frame, so a constant offset between the two does not matter.
+    -> (ok, worst position excess over the tolerance [m], worst turn difference [rad])"""
+    z0, x0 = streak[0][1], streak[0][2]
+    ok, worst_pos, worst_yaw = True, -math.inf, 0.0
+    for _, z, x in streak[1:]:
+        a, e = body_motion(z0, z), body_motion(x0, x)
+        excess = math.hypot(a[0] - e[0], a[1] - e[1]) - (tol_pos + tol_frac * math.hypot(e[0], e[1]))
+        dyaw = abs(wrap(a[2] - e[2]))
+        worst_pos, worst_yaw = max(worst_pos, excess), max(worst_yaw, dyaw)
+        ok = ok and excess <= 0.0 and dyaw <= tol_yaw
+    return ok, worst_pos, worst_yaw
+
+
+# ----------------------------------------------------------------------------
 # ROS 2 node
 # ----------------------------------------------------------------------------
 
@@ -275,9 +387,9 @@ try:
     from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, TransformStamped
     from nav_msgs.msg import OccupancyGrid, Odometry, Path
     from rclpy.node import Node
-    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
     from rclpy.time import Time
-    from sensor_msgs.msg import Imu
+    from sensor_msgs.msg import Imu, LaserScan
     from std_msgs.msg import Float64
     from tf2_ros import TransformBroadcaster
 
@@ -332,7 +444,22 @@ class EkfNode(Node):
         d('amcl_offset_m', 0.025)           # added to AMCL x and y: nav2 half-cell offset = map resolution / 2
         d('map_topic', '/map')              # read once, only to check amcl_offset_m ('' = no check)
         d('gate', CHI2_3DOF_99)
-        d('reset_after_rejects', 10)
+        d('reset_after_rejects', 10)        # confident AMCL poses rejected in a row before a jump is considered
+        # Robust jump to AMCL (2026-10-06, docstring RECOVERY)
+        d('amcl_max_sigma', 0.35)           # m: AMCL poses with sqrt(cov_xx + cov_yy) above this are ignored
+        d('reset_tol_pos', 0.15)            # m   AMCL motion vs odometry over the rejected poses ...
+        d('reset_tol_frac', 0.05)           #     ... + 5 % of the distance
+        d('reset_tol_yaw_deg', 3.0)         # deg
+        d('reset_scan_check', True)         # also require the scan to fit the map clearly better at AMCL's pose
+        d('scan_topic', '/scan_amcl')       # the scan AMCL uses
+        d('scan_beams', 60)                 # beams used by the scan check
+        d('scan_tol', 0.10)                 # m: a beam fits if measured and map range differ less
+        d('reset_scan_min', 0.6)            # AMCL's pose must explain >= 60 % of the beams ...
+        d('reset_scan_margin', 0.1)         # ... and 10 points more than the EKF's pose
+        d('laser_x', 0.275)                 # m   where the LiDAR sits on the car (base_link -> laser;
+        d('laser_y', 0.0)                   # m   sim: scan_distance_to_base_link)
+        d('laser_yaw', 0.0)                 # rad
+        d('test_fault', '')                 # TEST ONLY: 't_s,dx,dy,dyaw_deg' moves ekf_global's pose once
         d('history_s', 2.0)
         # Vehicle geometry for the slip angle
         d('lf', 0.15875); d('lr', 0.17145)
@@ -380,10 +507,21 @@ class EkfNode(Node):
         self.distance = 0.0
         self.truth = None
         self.truth_hist = deque(maxlen=400)
-        self.stats = {'acc': 0, 'rej': 0, 'nis': 0.0, 'amcl_err': []}
-        self.consecutive_rejects = 0
+        self.stats = self.new_stats()
+        self.streak = []                    # rejected confident AMCL poses in a row: (t_ns, z, x_then)
         self.imu_count = 0
         self.map_checked = False
+        self.wall_map = None                # walls of the map, for the scan check
+        self.scans = deque(maxlen=40)       # recent scans: (t_ns, msg)
+        self.last_refuse_log = -1e9
+        self.fault = None                   # test_fault (global EKF only)
+        self.fault_t0 = None
+        tf_ = str(p('test_fault')).strip()
+        if tf_ and self.global_mode:
+            vals = [float(v) for v in tf_.split(',')]
+            if len(vals) != 4:
+                raise ValueError("test_fault must be 't_s,dx,dy,dyaw_deg'")
+            self.fault = vals
 
         self.path = Path()
         self.path.header.frame_id = p('frame_id')
@@ -404,6 +542,8 @@ class EkfNode(Node):
                 self.create_subscription(OccupancyGrid, p('map_topic'), self.map_cb, QoSProfile(
                     depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                     reliability=ReliabilityPolicy.RELIABLE))
+            if p('use_amcl') and p('reset_scan_check'):
+                self.create_subscription(LaserScan, p('scan_topic'), self.scan_cb, qos_profile_sensor_data)
             tt = str(p('truth_topic')).strip()
             if tt and tt.lower() != 'none':
                 self.create_subscription(Odometry, tt, self.truth_cb, 10)
@@ -426,6 +566,15 @@ class EkfNode(Node):
             self.get_logger().info(
                 f"AMCL half-cell correction: +{100.0 * p('amcl_offset_m'):.2f} cm in x and y "
                 '(amcl_offset_m = map resolution / 2; 0 = off)')
+            self.get_logger().info(
+                f"jump to AMCL only if it is clearly right: ignore AMCL sigma > {p('amcl_max_sigma'):.2f} m; "
+                f"after {p('reset_after_rejects')} rejected poses AMCL must move like the odometry"
+                + (f" AND the scan ({p('scan_topic')}) must fit AMCL's pose >= {p('reset_scan_min'):.2f} and "
+                   f"{p('reset_scan_margin'):.2f} better than the EKF's" if p('reset_scan_check') else
+                   ' (scan check OFF)'))
+        if self.fault is not None:
+            self.get_logger().warn(f'TEST FAULT armed: ekf_global pose will move by ({self.fault[1]}, '
+                                   f'{self.fault[2]}) m, {self.fault[3]} deg, {self.fault[0]} s after the first IMU')
 
     # --- speed-scale calibration file ----------------------------------------
 
@@ -523,6 +672,17 @@ class EkfNode(Node):
             self.ekf.predict(self.v, w_m, beta, dt)
             self.distance += abs(self.ekf.x[4] * self.v) * dt
 
+        if self.fault is not None:                  # TEST ONLY (test_fault)
+            if self.fault_t0 is None:
+                self.fault_t0 = t
+            elif (t - self.fault_t0).nanoseconds * 1e-9 >= self.fault[0]:
+                _, dx_, dy_, dyaw_ = self.fault
+                self.ekf.x[0] += dx_
+                self.ekf.x[1] += dy_
+                self.ekf.x[2] = wrap(self.ekf.x[2] + math.radians(dyaw_))
+                self.history.buf.clear()
+                self.get_logger().warn(f'TEST FAULT: ekf_global pose moved by ({dx_}, {dy_}) m, {dyaw_} deg')
+                self.fault = None
         self.history.add(t.nanoseconds, self.ekf.x)
         self.publish_odom(msg.header.stamp, w_m)
 
@@ -543,21 +703,35 @@ class EkfNode(Node):
                                    p('amcl_min_sigma_pos'),
                                    math.radians(p('amcl_min_sigma_yaw_deg')))
         self.record_amcl_error(t_ns, z)
+        cov = msg.pose.covariance
+        if math.sqrt(max(cov[0] + cov[7], 0.0)) > p('amcl_max_sigma'):
+            self.stats['unsure'] += 1               # AMCL itself is unsure (lost?) -> ignore this pose
+            return
 
         nis = self.ekf.pose_nis(nu, R)
         if nis > p('gate'):
             self.stats['rej'] += 1
-            self.consecutive_rejects += 1
-            if self.consecutive_rejects >= p('reset_after_rejects'):
-                self.get_logger().warn(
-                    f'{self.consecutive_rejects} AMCL poses rejected in a row -> '
-                    'EKF assumes it is lost and jumps to AMCL')
-                self.ekf.reset_pose(z[0], z[1], z[2], R)
-                self.history.buf.clear()
-                self.consecutive_rejects = 0
+            self.streak.append((t_ns, z.copy(), x_then[:3].copy()))
+            if len(self.streak) >= p('reset_after_rejects'):
+                ok, why = self.jump_check(t_ns, z, x_then)
+                if ok:
+                    self.get_logger().warn(f'{len(self.streak)} AMCL poses rejected in a row; {why} '
+                                           '-> EKF jumps to AMCL')
+                    self.ekf.reset_pose(z[0], z[1], z[2], R)
+                    self.history.buf.clear()
+                    self.streak = []
+                    self.stats['jumps'] += 1
+                else:
+                    self.streak.pop(0)              # slide: the next rejected pose re-checks
+                    self.stats['refused'] += 1
+                    now = time.monotonic()
+                    if now - self.last_refuse_log > 2.0:
+                        self.last_refuse_log = now
+                        self.get_logger().warn(f'AMCL rejected {p("reset_after_rejects")}+ times in a row, '
+                                               f'NOT jumping: {why} -> EKF continues on odometry')
             return
 
-        self.consecutive_rejects = 0
+        self.streak = []
         nis, dx = self.ekf.pose_update(nu, R)
         self.history.shift(dx)
         self.stats['acc'] += 1
@@ -576,11 +750,57 @@ class EkfNode(Node):
         self.path.poses.clear()
         self.get_logger().info('EKF pose reset from /initialpose (bias and speed scale kept)')
 
+    def jump_check(self, t_ns, z, x_then):
+        """-> (ok, reason): may the EKF jump to AMCL? (docstring RECOVERY)"""
+        p = lambda n: self.get_parameter(n).value  # noqa: E731
+        ok, worst_pos, worst_yaw = motion_consistent(self.streak, p('reset_tol_pos'), p('reset_tol_frac'),
+                                                     math.radians(p('reset_tol_yaw_deg')))
+        if not ok:
+            return False, (f'AMCL did not move like the odometry ({worst_pos:+.2f} m over the tolerance, '
+                           f'turn {math.degrees(worst_yaw):.1f} deg)')
+        if not p('reset_scan_check'):
+            return True, 'AMCL moved like the odometry (scan check off)'
+        scan = self.scan_at(t_ns)
+        if self.wall_map is None or scan is None:
+            return False, 'AMCL moved like the odometry, but no map or no scan for the scan check'
+        fit_amcl, fit_ekf = self.scan_fits(scan, (z, x_then[:3]))
+        if fit_amcl < p('reset_scan_min') or fit_amcl - fit_ekf < p('reset_scan_margin'):
+            return False, (f'AMCL moved like the odometry, but the scan does not fit it clearly better '
+                           f'(scan fit AMCL {fit_amcl:.2f}, EKF {fit_ekf:.2f})')
+        return True, (f'AMCL moved like the odometry and the scan fits it better '
+                      f'(scan fit AMCL {fit_amcl:.2f}, EKF {fit_ekf:.2f})')
+
+    def scan_fits(self, scan, poses):
+        p = lambda n: self.get_parameter(n).value  # noqa: E731
+        r, ang = scan_beams(scan.ranges, scan.angle_min, scan.angle_increment, scan.range_min,
+                            scan.range_max, int(p('scan_beams')))
+        laser = (p('laser_x'), p('laser_y'), p('laser_yaw'))
+        return [scan_fit(self.wall_map, q, laser, ang, r, scan.range_max, p('scan_tol')) for q in poses]
+
+    def scan_cb(self, msg):
+        self.scans.append((Time.from_msg(msg.header.stamp).nanoseconds, msg))
+
+    def scan_at(self, t_ns, max_dt_ns=50_000_000):
+        """The scan taken at t_ns (AMCL's pose carries the stamp of the scan it used)."""
+        if not self.scans:
+            return None
+        ts, msg = min(self.scans, key=lambda e: abs(e[0] - t_ns))
+        return msg if abs(ts - t_ns) <= max_dt_ns else None
+
     def map_cb(self, msg):
-        """Once: is amcl_offset_m half the resolution of the map AMCL uses?"""
+        """Once: is amcl_offset_m half the resolution of the map AMCL uses? + keep its walls."""
         if self.map_checked:
             return
         self.map_checked = True
+        info = msg.info
+        o = info.origin
+        if abs(o.orientation.z) > 1e-6 or abs(o.orientation.x) > 1e-6 or abs(o.orientation.y) > 1e-6:
+            self.get_logger().warn('map origin is rotated -> no scan check (jumps to AMCL refused)')
+        else:
+            self.wall_map = WallMap.from_grid(msg.data, info.width, info.height, info.resolution,
+                                              o.position.x, o.position.y)
+            self.get_logger().info(f'scan check: map {info.width} x {info.height} cells @ {info.resolution:.3f} m, '
+                                   f'{int(self.wall_map.occ.sum())} wall cells')
         off, res = self.get_parameter('amcl_offset_m').value, msg.info.resolution
         if abs(off - 0.5 * res) > 1e-4:
             self.get_logger().warn(
@@ -674,11 +894,29 @@ class EkfNode(Node):
             mean_nis = s['nis'] / s['acc'] if s['acc'] else float('nan')
             amcl = (f"{sum(s['amcl_err']) / len(s['amcl_err']):4.2f} m"
                     if s['amcl_err'] else ' n/a')
-            line += (f" | AMCL used {s['acc']:2d} rej {s['rej']:2d}"
+            line += (f" | AMCL used {s['acc']:2d} rej {s['rej']:2d} unsure {s['unsure']:2d}"
                      f' NIS {mean_nis:4.1f} AMCL err {amcl}')
+            if s['refused'] or s['jumps']:
+                line += f" | jump refused {s['refused']} JUMPED {s['jumps']}"
+            fit = self.scan_fit_now()
+            if fit is not None:
+                line += f' | scan fit {fit:.2f}'
         line += f' | ZUPTs {self.zupt_count}'
-        self.stats = {'acc': 0, 'rej': 0, 'nis': 0.0, 'amcl_err': []}
+        self.stats = self.new_stats()
         self.get_logger().info(line)
+
+    @staticmethod
+    def new_stats():
+        return {'acc': 0, 'rej': 0, 'nis': 0.0, 'amcl_err': [], 'unsure': 0, 'refused': 0, 'jumps': 0}
+
+    def scan_fit_now(self):
+        """Health check every 2 s: how well does the latest scan fit the map at the EKF's
+        pose? (~0.9-1.0 when localized; proves the scan check sees what it should.)"""
+        if self.wall_map is None or not self.scans:
+            return None
+        t_ns, scan = self.scans[-1]
+        x = self.history.at(t_ns)
+        return None if x is None else self.scan_fits(scan, (x[:3],))[0]
 
 
 def main(args=None):
