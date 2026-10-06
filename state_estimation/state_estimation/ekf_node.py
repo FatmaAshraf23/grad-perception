@@ -42,6 +42,12 @@ UPDATE 2 -- AMCL pose (global EKF only)                       NEW in v3
         (inflated because AMCL and this EKF share the same odometry, so their
          errors are correlated -- treating them as independent would make the
          EKF overconfident)
+        amcl_cov_scale 4 (2026-10-06, was 2): with AMCL's motion noise lowered
+        to 0.02 (amcl_sim.yaml) AMCL reports a much smaller covariance, but its
+        errors still change slowly (~7 fixes/s that share one error), so the EKF
+        averaged them as if independent and became overconfident (run H: only
+        80-93 % of position errors inside 2 sigma). Offline replay: scale 4 ->
+        98-99 % inside 2 sigma, s error p95 4.8 -> 4.2 cm.
     Gate: NIS < 11.34 (chi-square, 3 degrees of freedom, 99 %)
 
     DELAYED MEASUREMENT: the AMCL pose belongs to the moment the scan was
@@ -302,7 +308,7 @@ class EkfNode(Node):
         # AMCL update (global EKF)
         d('use_amcl', True)
         d('amcl_topic', '/amcl_pose')
-        d('amcl_cov_scale', 2.0)            # inflate AMCL covariance (shared odometry)
+        d('amcl_cov_scale', 4.0)            # inflate AMCL covariance (shared odometry; 2 -> 4 2026-10-06)
         d('amcl_min_sigma_pos', 0.10)       # m (0.10 chosen 2026-10-01, was 0.05)
         d('amcl_min_sigma_yaw_deg', 1.0)    # deg
         d('gate', CHI2_3DOF_99)
