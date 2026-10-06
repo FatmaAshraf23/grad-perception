@@ -26,15 +26,26 @@ amcl:
     recovery_alpha_fast: 0.0      # "kidnapped robot" recovery later)
 
     # --- Motion model: how much noise to add when moving the particles ---
-    # Our local EKF is good (few cm per m), so these are smaller than the
-    # defaults (0.2). alpha1: rotation noise from rotation, alpha2: rotation
-    # noise from translation, alpha3: translation noise from translation,
-    # alpha4: translation noise from rotation.
+    # alpha1: rotation noise from rotation, alpha2: rotation noise from
+    # translation, alpha3: translation noise from translation, alpha4:
+    # translation noise from rotation.
+    # 2026-10-06: 0.1 -> 0.02 (jobs 058-063: offline AMCL replays of the same
+    # recorded laps, tools in runner/tools). With 0.1 AMCL assumed the odometry
+    # distance could be ~30 % wrong per step. In the long featureless corridors
+    # (the walls show nothing along the corridor) its particle cloud then slid
+    # BACKWARDS, up to 38 cm behind at the corridor end, and dragged the EKF:
+    # the big along-track (s) error in Corner 1. Our odometry (ekf_local:
+    # calibrated wheel speed + gyro) is far better than that. Replays, 0.1 ->
+    # 0.02: AMCL along-track p95 28 -> 8 cm (no slide), EKF s p95 8.4 -> 4.5 cm,
+    # Corner 1 13 -> 6 cm, EKF still honest (95 % inside 2 sigma). 0.01/0.005
+    # are as accurate but make AMCL and then the EKF overconfident (87/83 %).
+    # REAL CAR: re-check with the replay bench on a real recording -- wheel slip
+    # and servo play make real odometry worse than the simulator's.
     robot_model_type: "nav2_amcl::DifferentialMotionModel"
-    alpha1: 0.1
-    alpha2: 0.1
-    alpha3: 0.1
-    alpha4: 0.1
+    alpha1: 0.02
+    alpha2: 0.02
+    alpha3: 0.02
+    alpha4: 0.02
     alpha5: 0.0
 
     # --- Sensor model: how a scan is scored against the wall map ---
