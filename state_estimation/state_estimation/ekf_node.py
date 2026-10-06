@@ -48,6 +48,22 @@ UPDATE 2 -- AMCL pose (global EKF only)                       NEW in v3
         averaged them as if independent and became overconfident (run H: only
         80-93 % of position errors inside 2 sigma). Offline replay: scale 4 ->
         98-99 % inside 2 sigma, s error p95 4.8 -> 4.2 cm.
+    HALF-CELL CORRECTION (2026-10-06): z uses AMCL's x and y + amcl_offset_m.
+        nav2 AMCL puts the CENTRE of map cell i at  origin + i * resolution
+        (nav2_amcl map.hpp MAP_GXWX, amcl_node.cpp convertMap), but ROS -- the
+        map_server / RViz convention, the simulator, our apex_track track files --
+        puts it at  origin + (i + 0.5) * resolution. So AMCL sees every wall half
+        a cell towards -x and -y, and its pose comes out shifted by
+        (-res/2, -res/2): measured (-2.9, -2.1) cm on closed1 and (-3.1, -2.4) cm
+        on Levine (5 cm maps). On the track that is an along-track error whose
+        sign depends on the driving direction (behind when driving +x, ahead
+        when driving -x), and in a corner it becomes kappa * ds of heading
+        error. Offline replay: s error p95 5.9 -> 3.3 cm; run K re-projected:
+        corner e_psi p95 2.48 -> 1.03 deg, whole lap 1.88 -> 0.66 deg.
+        amcl_offset_m must be HALF THE RESOLUTION OF THE MAP AMCL USES (0.025 for
+        a 5 cm map, 0.0125 for 2.5 cm); the node compares it with /map once at
+        start-up and warns if it doesn't match. 0 = no correction.
+        Not corrected: AMCL's own /amcl_pose and its TF map -> odom.
     Gate: NIS < 11.34 (chi-square, 3 degrees of freedom, 99 %)
 
     DELAYED MEASUREMENT: the AMCL pose belongs to the moment the scan was
@@ -86,6 +102,7 @@ UPDATE 2 -- AMCL pose (global EKF only)                       NEW in v3
 
 Topics
   in : /imu/data, /vehicle/measured, /amcl_pose (global), /initialpose (global)
+       <map_topic> (global, read once: checks amcl_offset_m against the resolution)
        <truth_topic> (global, simulation truth for the 2-s report only;
                       default 'none' = off -- the real car has no truth)
   out: <odom_topic>, <path_topic> (only if path_period_s > 0; for viewing),
@@ -256,8 +273,9 @@ try:
     import rclpy
     from ackermann_msgs.msg import AckermannDriveStamped
     from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, TransformStamped
-    from nav_msgs.msg import Odometry, Path
+    from nav_msgs.msg import OccupancyGrid, Odometry, Path
     from rclpy.node import Node
+    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
     from rclpy.time import Time
     from sensor_msgs.msg import Imu
     from std_msgs.msg import Float64
@@ -311,6 +329,8 @@ class EkfNode(Node):
         d('amcl_cov_scale', 4.0)            # inflate AMCL covariance (shared odometry; 2 -> 4 2026-10-06)
         d('amcl_min_sigma_pos', 0.10)       # m (0.10 chosen 2026-10-01, was 0.05)
         d('amcl_min_sigma_yaw_deg', 1.0)    # deg
+        d('amcl_offset_m', 0.025)           # added to AMCL x and y: nav2 half-cell offset = map resolution / 2
+        d('map_topic', '/map')              # read once, only to check amcl_offset_m ('' = no check)
         d('gate', CHI2_3DOF_99)
         d('reset_after_rejects', 10)
         d('history_s', 2.0)
@@ -363,6 +383,7 @@ class EkfNode(Node):
         self.stats = {'acc': 0, 'rej': 0, 'nis': 0.0, 'amcl_err': []}
         self.consecutive_rejects = 0
         self.imu_count = 0
+        self.map_checked = False
 
         self.path = Path()
         self.path.header.frame_id = p('frame_id')
@@ -378,6 +399,11 @@ class EkfNode(Node):
         if self.global_mode:
             self.create_subscription(PoseWithCovarianceStamped, p('amcl_topic'), self.amcl_cb, 10)
             self.create_subscription(PoseWithCovarianceStamped, '/initialpose', self.reset_cb, 10)
+            if p('use_amcl') and str(p('map_topic')).strip():
+                # map_server publishes the map once, "latched" (transient local) -> late joiners get it
+                self.create_subscription(OccupancyGrid, p('map_topic'), self.map_cb, QoSProfile(
+                    depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                    reliability=ReliabilityPolicy.RELIABLE))
             tt = str(p('truth_topic')).strip()
             if tt and tt.lower() != 'none':
                 self.create_subscription(Odometry, tt, self.truth_cb, 10)
@@ -396,6 +422,10 @@ class EkfNode(Node):
         what = ('GLOBAL (map frame, wheel + gyro + AMCL)' if self.global_mode
                 else f'LOCAL (odom frame, wheel + gyro), TF {p("frame_id")} -> {p("child_frame_id")}')
         self.get_logger().info(f'EKF v3 {what}')
+        if self.global_mode and p('use_amcl'):
+            self.get_logger().info(
+                f"AMCL half-cell correction: +{100.0 * p('amcl_offset_m'):.2f} cm in x and y "
+                '(amcl_offset_m = map resolution / 2; 0 = off)')
 
     # --- speed-scale calibration file ----------------------------------------
 
@@ -505,7 +535,8 @@ class EkfNode(Node):
         if x_then is None:
             return                                  # too old, or no IMU yet
         pose = msg.pose.pose
-        z = np.array([pose.position.x, pose.position.y, yaw_from_quat(pose.orientation)])
+        off = p('amcl_offset_m')                    # nav2 AMCL half-cell offset (see docstring)
+        z = np.array([pose.position.x + off, pose.position.y + off, yaw_from_quat(pose.orientation)])
         nu = z - x_then[:3]
         nu[2] = wrap(nu[2])
         R = amcl_measurement_noise(msg.pose.covariance, p('amcl_cov_scale'),
@@ -544,6 +575,19 @@ class EkfNode(Node):
         self.distance = 0.0
         self.path.poses.clear()
         self.get_logger().info('EKF pose reset from /initialpose (bias and speed scale kept)')
+
+    def map_cb(self, msg):
+        """Once: is amcl_offset_m half the resolution of the map AMCL uses?"""
+        if self.map_checked:
+            return
+        self.map_checked = True
+        off, res = self.get_parameter('amcl_offset_m').value, msg.info.resolution
+        if abs(off - 0.5 * res) > 1e-4:
+            self.get_logger().warn(
+                f'amcl_offset_m is {off:.4f} m but the map resolution is {res:.4f} m: it should be '
+                f'{0.5 * res:.4f} m (nav2 AMCL half-cell offset, see the ekf_node docstring)')
+        else:
+            self.get_logger().info(f'amcl_offset_m {off:.4f} m = half the map resolution ({res:.3f} m): OK')
 
     def truth_cb(self, msg):
         self.truth = msg
