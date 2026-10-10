@@ -5,9 +5,11 @@ find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
 
-# generates C++ and Python code for the message, for every node that uses it
+# generates C++ and Python code for the messages, for every node that uses them
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/StateEstimate.msg"
+  "msg/Obstacle.msg"
+  "msg/ObstacleArray.msg"
   DEPENDENCIES std_msgs
 )
 

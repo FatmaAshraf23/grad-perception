@@ -2,16 +2,20 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>lidar_perception</name>
-  <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <version>0.1.0</version>
+  <description>2D LiDAR perception: obstacle list for planning (map difference + tracking, obstacle_node), clustering, cone detection; simulator launch with a separate car map (car_map).</description>
   <maintainer email="fatmaashraf54321@gmail.com">fatma</maintainer>
-  <license>TODO: License declaration</license>
+  <license>MIT</license>
 
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
   <depend>visualization_msgs</depend>
   <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
   <depend>tf2_ros</depend>
+  <depend>apex_msgs</depend>
+  <depend>apex_track</depend>
+  <exec_depend>python3-numpy</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>topic_tools</exec_depend>
   <exec_depend>nav2_map_server</exec_depend>

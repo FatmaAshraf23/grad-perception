@@ -2,8 +2,8 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>apex_msgs</name>
-  <version>0.1.0</version>
-  <description>APEX shared message types: StateEstimate (perception to control state contract v0.2).</description>
+  <version>0.2.0</version>
+  <description>APEX shared message types: StateEstimate (perception to control state contract v0.2), ObstacleArray / Obstacle (obstacle list, draft 0.1).</description>
   <maintainer email="fatmaashraf54321@gmail.com">Fatma Ashraf</maintainer>
   <license>MIT</license>
 
