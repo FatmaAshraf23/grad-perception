@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 """obstacle_list.py -- everything the obstacle node does, without ROS (so it can be replayed and tested offline).
 
-    builder = ObstacleList(wall_distance, mount)
+    builder = ObstacleList(wall_distance, mount, aligner, range_offset)
     builder.add_pose(t, x, y, yaw, v, r, ok, reset_flag, std_xy, std_psi)   # every StateEstimate message (100 Hz)
     result = builder.process_scan(t, ranges, angle_min, angle_inc, range_min, range_max)   # every scan
 
 process_scan():
+  0. RANGE OFFSET (step 3.3): every real return is shortened by range_offset -- how much too FAR this LiDAR measures
+     (the simulator's: 2.2 cm, its ray marching stops up to one map cell inside a surface; a real LiDAR: measure it).
+     Beams without a return (inf, NaN, < range_min, >= range_max) are left exactly as they are, so "no return" stays
+     "no return" (the forgetting rule must never take it for a beam that went through). The alignment always uses
+     the corrected ranges, and so do the detection and the forgetting of every ALIGNED scan. A scan that is NOT
+     aligned (alignment off or refused) is detected with the ranges as measured, exactly as in step 3.2: TOL (10 cm,
+     step 2.2) was chosen while the overshoot still pushed every wall point ~2 cm INTO the walls -- a hidden margin
+     against a pose error towards a wall. Replay of job 086 run B without the alignment but with corrected ranges:
+     StateEstimate 8 cm off (still OK) made a wall look new -> a false obstacle for 63 s. Aligned scans don't need
+     that margin (pose error across the car ~0.3 cm p95). So range_offset has no effect when align_scans is off.
+     range_offset 0 = step 3.2.
   1. POSE at the scan's time: interpolated between the two StateEstimate poses around the scan stamp (or
      extrapolated with speed and yaw rate, at most MAX_EXTRAPOLATION past the newest one). None = no pose.
   2. SAFETY RULES (step 2.6, replays of a 3 s pose fault):
@@ -31,6 +42,8 @@ import math
 import time
 from collections import deque
 
+import numpy as np
+
 try:                                    # inside the ROS package lidar_perception
     from lidar_perception.map_difference import lidar_position, new_points, objects, scan_to_map
     from lidar_perception.obstacle_tracker import ObstacleTracker
@@ -51,6 +64,16 @@ def _wrap(a):
     return (a + math.pi) % (2 * math.pi) - math.pi
 
 
+def correct_ranges(ranges, range_min, range_max, offset):
+    """The scan's ranges with `offset` [m] subtracted from every REAL return (finite, >= range_min, < range_max);
+    beams without a return keep their value. A copy -- the caller's array is not changed."""
+    r = np.array(ranges, dtype=float)
+    if offset:
+        real = np.isfinite(r) & (r >= range_min) & (r < range_max - 1e-3)
+        r[real] -= offset
+    return r
+
+
 def pose_jumped(prev, now, v, w):
     """prev / now = (t, x, y, yaw); v, w = speed and yaw rate at prev. True if the pose moved more than the car can."""
     dt = now[0] - prev[0]
@@ -61,10 +84,11 @@ def pose_jumped(prev, now, v, w):
 
 
 class ObstacleList:
-    def __init__(self, wall_distance, mount, aligner=None):
+    def __init__(self, wall_distance, mount, aligner=None, range_offset=0.0):
         self.wd = wall_distance
         self.mount = mount                   # (x, y, yaw) of the LiDAR relative to the pose's point
         self.aligner = aligner               # scan_align.ScanAligner or None (step 3.1 behaviour)
+        self.range_offset = float(range_offset)   # m this LiDAR measures too far (step 3.3); 0 = no correction
         self.tracker = ObstacleTracker()
         self.poses = deque()                 # (t, x, y, yaw unwrapped, v, r, ok, (std_xy, std_psi) or None)
         self.jump_pending = False
@@ -117,12 +141,15 @@ class ObstacleList:
         x, y, yaw, ok, pose_std = pose
         aligned, correction, align_us = False, (0.0, 0.0), 0.0
         if ok and self.aligner is not None and pose_std is not None:
+            corrected = correct_ranges(ranges, range_min, range_max, self.range_offset) if self.range_offset else ranges
             t0 = time.perf_counter()
-            al = self.aligner.align(ranges, angle_min, angle_inc, range_min, range_max, (x, y, yaw), pose_std, self.mount)
+            al = self.aligner.align(corrected, angle_min, angle_inc, range_min, range_max, (x, y, yaw), pose_std,
+                                    self.mount)
             align_us = (time.perf_counter() - t0) * 1e6
             if al['ok']:
                 (x, y, yaw), pose_std = al['pose'], al['std']
                 aligned, correction = True, (al['shift'], al['turn'])
+                ranges = corrected                             # see 0.: only an aligned scan uses them
         reset = self.jump_pending
         if reset:
             self.tracker.reset()

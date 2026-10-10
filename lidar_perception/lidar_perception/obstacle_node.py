@@ -11,7 +11,9 @@ the LiDAR looks through the place). Step 3.1: the tracker is told how sure the p
 detections made with an unsure pose count less and make the reported std_xy_m larger. Step 3.2 (align_scans): before
 detection each scan is put on the walls of the car's map (scan_align.py), which removes most of StateEstimate's pose
 error at that moment (sim: across the car p95 3.3 -> 1.3 cm, heading 0.57 -> 0.32 deg) -- obstacle positions get more
-accurate and the alignment's own, calibrated uncertainty replaces StateEstimate's.
+accurate and the alignment's own, calibrated uncertainty replaces StateEstimate's. Step 3.3 (range_offset_m): the
+alignment, and the detection of every aligned scan, use the ranges shortened by the LiDAR's range offset (how much too
+far it measures; simulator 0.022 m); an unaligned scan keeps the ranges as measured (see obstacle_list.py, 0.).
 Publishes apex_msgs/ObstacleArray (draft schema "apex-obstacles/0.1") with
 the CONFIRMED obstacles in the map frame and in track coordinates (apex_track), once per scan, stamped with the
 scan's time; plus a MarkerArray for Foxglove.
@@ -26,6 +28,9 @@ Parameters
                   0.275 / 0 / 0 (ref_to_cg_m = 0). REAL CAR: measure (base_link -> laser minus base_link -> CG).
   publish_markers  true: /obstacles/markers for Foxglove
   align_scans     true: align every scan to the map's walls before detection (step 3.2); false = step 3.1
+  range_offset_m  how much too FAR the LiDAR measures [m] (step 3.3), subtracted from every real return of the
+                  alignment and of every aligned scan -- no effect with align_scans false. Simulator (f1tenth_gym ray
+                  marching): 0.022. REAL CAR: measure it (default 0 = none).
   stats_every_s   log line every ... s (scans, statuses, list size, work per scan, latency, alignment, CPU)
 """
 import time
@@ -71,6 +76,7 @@ class ObstacleNode(Node):
         d('laser_yaw', 0.0)
         d('publish_markers', True)
         d('align_scans', True)
+        d('range_offset_m', 0.0)
         d('stats_every_s', 5.0)
         p = lambda n: self.get_parameter(n).value  # noqa: E731
         self.mount = (float(p('laser_x')), float(p('laser_y')), float(p('laser_yaw')))
@@ -80,6 +86,7 @@ class ObstacleNode(Node):
         self.pending = None                  # (scan message, wall time it arrived)
         self.seq = 0
         self.align = bool(p('align_scans'))
+        self.range_offset = float(p('range_offset_m'))
         self.stats = self.new_stats()
         self.last_stats = time.monotonic()
         self.last_cpu = time.process_time()
@@ -95,7 +102,12 @@ class ObstacleNode(Node):
         self.get_logger().info(
             f'track {self.track.track_id} ({self.track.track_hash}); scans {p("scan_topic")}; LiDAR at '
             f'{self.mount} from the StateEstimate point; tolerance {TOL * 100:.0f} cm, range {MAX_RANGE:.0f} m; '
-            f'scan alignment {"ON" if self.align else "OFF"}; waiting for /map')
+            f'scan alignment {"ON" if self.align else "OFF"}; range offset {self.range_offset * 100:.1f} cm'
+            + (' (used for the alignment and every aligned scan)' if self.range_offset and self.align else '')
+            + '; waiting for /map')
+        if self.range_offset and not self.align:
+            self.get_logger().warn('range_offset_m is only used together with the scan alignment (align_scans true): '
+                                   'unaligned scans keep the ranges as measured -- the offset has no effect now')
 
     @staticmethod
     def new_stats():
@@ -109,7 +121,7 @@ class ObstacleNode(Node):
         t0 = time.perf_counter()
         wd = WallDistance(grid, info.resolution, info.origin.position.x, info.origin.position.y)
         aligner = ScanAligner(wd, grid) if self.align else None
-        self.builder = ol.ObstacleList(wd, self.mount, aligner)   # a new map = a new list
+        self.builder = ol.ObstacleList(wd, self.mount, aligner, self.range_offset)   # a new map = a new list
         self.get_logger().info(f'/map {info.width} x {info.height} @ {info.resolution:.3f} m: distance-to-wall grid'
                                + (' + signed distance field for the alignment' if aligner else '')
                                + f' built in {(time.perf_counter() - t0) * 1000:.0f} ms ({int(wd.wall.sum())} wall cells)')
