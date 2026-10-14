@@ -1,0 +1,19 @@
+# Where the sensors sit on the car -- SIMULATOR (f1tenth_gym_ros). Read by apex_description sensor_frames,
+# which lidar_perception sim_perception.launch.py starts for ego_racecar/ (the true car) and est/ (the estimated car).
+#
+# base_link = the point StateEstimate reports: the centre of gravity, ON THE GROUND (z = 0),
+#             x forward, y left, z up (ROS REP 103). Positions in METRES, angles in DEGREES:
+#   yaw > 0 = turned LEFT     pitch > 0 = tilted DOWN     roll > 0 = left side UP (clockwise, seen from behind)
+status: simulator
+laser:          # MUST equal the simulator's sim.yaml lidar_base_link_to_lidar_tf [0.275, 0.0, 0.0]
+  x: 0.275      #   (check_frames compares them; the EKF / obstacle node laser_x default is the same)
+  y: 0.0
+  z: 0.0        # the simulator is 2-D: its scan has no height
+  yaw: 0.0
+camera:         # the simulator has no camera -- the FAKE camera (fusion prep) will see from here:
+  x: 0.20       #   behind the LiDAR and raised, looking slightly down (a typical F1TENTH layout)
+  y: 0.0
+  z: 0.15
+  roll: 0.0
+  pitch: 8.0
+  yaw: 0.0

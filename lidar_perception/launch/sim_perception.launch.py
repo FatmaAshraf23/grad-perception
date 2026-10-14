@@ -22,6 +22,12 @@ car_map (2026-10-07, obstacle detection) -- the WORLD and the CAR'S MAP are two 
   walls. Example (closed1 with 3 cones in the world, made by make_cone_world.py):
     config:=$HOME/apex_maps/closed1_cones/sim_closed1_cones.yaml car_map:=$HOME/apex_maps/closed1/closed1.yaml
   Default '' = the old behaviour (one map for both).
+
+sensor_frames (2026-10-14, fusion prep) -- where the sensors sit, as static TFs (apex_description sensor_frames,
+apex_description/config/sensor_mounts_sim.yaml), on BOTH cars: ego_racecar/ (the simulator's true car) and est/
+(the estimated car):   <car>/base_link -> <car>/camera_link -> <car>/camera_optical_frame
+The LiDAR frames are not published here: the simulator (ego_racecar/laser) and sim_scan_relay (est/laser) already
+do. Check: ros2 run apex_description check_frames --mounts sim --frame-prefix est/   sensor_frames:=false = off.
 """
 import os
 
@@ -84,10 +90,19 @@ def generate_launch_description():
         condition=IfCondition(cones),
     )
 
+    # where the sensors sit (static TFs) on the true car (ego_racecar/) and on the estimated car (est/) -- 2026-10-14
+    sensor_frames = Node(
+        package='apex_description', executable='sensor_frames', name='sensor_frames', output='screen',
+        parameters=[{'mounts_file': 'sim', 'prefixes': 'ego_racecar/,est/', 'publish_laser': False}],
+        condition=IfCondition(LaunchConfiguration('sensor_frames')),
+    )
+
     return LaunchDescription([
         DeclareLaunchArgument('cones', default_value='false'),
         DeclareLaunchArgument('car_map', default_value='',
                               description="Map the car's software gets on /map ('' = the simulator's own map)"),
+        DeclareLaunchArgument('sensor_frames', default_value='true',
+                              description='static TFs of the sensors (apex_description) on ego_racecar/ and est/'),
         OpaqueFunction(function=_simulator),
-        throttle, scan_cluster, cone_map,
+        throttle, scan_cluster, cone_map, sensor_frames,
     ])
