@@ -1,0 +1,22 @@
+# 640 x 480 made by cv2.resize(2560x1440 frame, (640, 480)) -- a SQUASH (x * 1/4, y * 1/3), no crop.
+# Converted from calibration_2560x1440_k3fixed_sq.yaml (job 106). WRONG if the streamer crops before resizing.
+image_width: 640
+image_height: 480
+camera_name: iphone_iriun
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [748.472839, 0.000000, 335.172741, 0.000000, 1000.794742, 235.273704, 0.000000, 0.000000, 1.000000]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [0.138469, 0.185298, -0.007312, 0.008586, 0.000000]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [748.472839, 0.000000, 335.172741, 0.000000, 0.000000, 1000.794742, 235.273704, 0.000000, 0.000000, 0.000000, 1.000000, 0.000000]

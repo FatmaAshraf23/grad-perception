@@ -1,0 +1,19 @@
+flags: k3 fixed to 0
+42 pictures in captures_20261013_204622, board 9 x 6 inner corners, square 25.00 x 25.14 mm (across x down)
+corners found in 42 of 42 ({'SB': 41, 'classic': 1})
+
+first pass: RMS 0.757 px over 42 pictures
+  dropped img_019.png: error 1.58 px (median 0.63)
+
+FINAL (41 pictures, 2560 x 1440): RMS reprojection error 0.724 px (per picture median 0.603, max 1.466)
+  fx   2993.89 +- 4.55 px    fy   3002.38 +- 4.42 px   (fx/fy 0.9972)
+  cx   1342.19 +- 6.49 px    cy    706.82 +- 4.60 px   (image centre 1280, 720)
+  D  k1 +0.1385  k2 +0.1853  p1 -0.00731  p2 +0.00859  k3 +0.0000
+     (+- 0.0087 0.1208 0.00078 0.00114 0.0000)
+  field of view: horizontal 46.3 deg, vertical 27.0 deg
+
+HOLD-OUT (20 splits, 33 train / 8 test): train RMS 0.716 px, TEST RMS 0.753 px (max 0.931); fx spread 7.48 px
+  good: test error close to the train error and both < ~0.5 px (at this resolution < ~1 px is usable)
+image covered by corners: 65 % of an 8 x 5 grid (edges matter for distortion)
+board distance 0.49-1.64 m, tilt 3-52 deg
+written: calibration_{2560x1440, 1920x1080, 1280x720, 960x540, 640x360}.yaml

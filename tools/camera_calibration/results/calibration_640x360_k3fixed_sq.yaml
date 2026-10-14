@@ -1,0 +1,20 @@
+image_width: 640
+image_height: 360
+camera_name: iphone_iriun
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [748.472839, 0.000000, 335.172741, 0.000000, 750.596057, 176.330278, 0.000000, 0.000000, 1.000000]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [0.138469, 0.185298, -0.007312, 0.008586, 0.000000]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [748.472839, 0.000000, 335.172741, 0.000000, 0.000000, 750.596057, 176.330278, 0.000000, 0.000000, 0.000000, 1.000000, 0.000000]
