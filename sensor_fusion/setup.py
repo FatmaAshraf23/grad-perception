@@ -14,12 +14,13 @@ setup(
     zip_safe=True,
     maintainer='fatma',
     maintainer_email='fatma@todo.todo',
-    description='Camera-LiDAR fusion: projection (LiDAR point <-> pixel) + demo',
+    description='Camera-LiDAR fusion: projection (LiDAR point <-> pixel), camera-LiDAR extrinsic calibration + demos',
     license='MIT',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'projection_demo = sensor_fusion.projection_demo:main',
+            'calib_demo = sensor_fusion.calib_demo:main',
         ],
     },
 )
