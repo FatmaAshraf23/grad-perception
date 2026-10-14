@@ -27,6 +27,7 @@ setup(
             'calib_capture = sensor_fusion.calib_capture:main',
             'calib_solve = sensor_fusion.calib_solve:main',
             'calib_fake_session = sensor_fusion.calib_fake_session:main',
+            'fake_camera = sensor_fusion.fake_camera:main',
         ],
     },
 )

@@ -10,6 +10,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/StateEstimate.msg"
   "msg/Obstacle.msg"
   "msg/ObstacleArray.msg"
+  "msg/CameraDetection.msg"
+  "msg/CameraDetectionArray.msg"
   DEPENDENCIES std_msgs
 )
 
