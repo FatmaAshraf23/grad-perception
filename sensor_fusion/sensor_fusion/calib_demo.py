@@ -1,6 +1,6 @@
 """calib_demo -- a FAKE camera-LiDAR calibration session, solved and drawn: what you will do on the real car.
 
-16 board poses (1.1-2.0 m ahead, left / centre / right of the picture, turned AND tilted), the corner pixels the
+20 board poses (1.0-1.9 m ahead, left / centre / right of the picture, turned AND tilted), the corner pixels the
 camera detects (+0.3 px noise), 10 LiDAR scans per pose (+1 cm noise) in a 6 x 5 m room, a first guess off by a few
 cm / degrees -> lidar_camera_calib.calibrate() -> the camera's mount vs the truth (sensor_mounts_car.yaml).
 Figure: top view (boards, LiDAR returns, the ones used) + the camera picture of 2 poses: the LiDAR points on the

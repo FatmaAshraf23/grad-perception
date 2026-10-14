@@ -28,13 +28,15 @@ def board_pose(center, turn_deg, tilt_deg, objp):
 
 
 def default_specs(laser_z, tilted=True):
-    """16 poses: 1.1-2.0 m ahead, left / centre / right of the picture, turned up to 35 deg, tilted up to 25 deg (tilted=False:
-    all vertical -- the degenerate case). The pattern centre near the LiDAR's height, so the scan crosses it."""
-    combos = [(-30, -20), (30, 20), (0, 25), (0, -25), (-20, 15), (20, -15), (35, 10), (-35, -10)]
+    """20 poses = the recommended session: 1.0-1.9 m ahead, left / centre / right of the picture, turned up to 35 deg
+    and TILTED 15-35 deg both ways (tilted=False: all vertical -- the degenerate case). The pattern centre near the
+    LiDAR's height, so the scan crosses it. (2026-10-14: 16 poses with tilts of 10-25 deg left the height / pitch /
+    roll WEAK in the end-to-end test.)"""
+    combos = [(-30, -25), (30, 25), (0, 30), (0, -30), (-20, 25), (20, -25), (35, -15), (-35, 15), (-15, -35), (15, 35)]
     specs = []
     for k, (turn, tilt) in enumerate(combos * 2):
-        half = k // 8                               # the second 8 poses: other distances / sides / heights
-        dist = (1.1, 1.4, 1.7, 2.0)[(k + half) % 4]
+        half = k // len(combos)                     # the second round: other distances / sides / heights
+        dist = (1.0, 1.3, 1.6, 1.9)[(k + half) % 4]
         lat = (-0.40, 0.0, 0.40, 0.20)[(k // 2 + 2 * half) % 4] * dist / 1.5   # spread over the whole picture
         zc = laser_z + (0.0, 0.03, -0.03, 0.015)[(k + 1 + half) % 4]
         specs.append((dist, lat, zc, turn, tilt if tilted else 0.0))

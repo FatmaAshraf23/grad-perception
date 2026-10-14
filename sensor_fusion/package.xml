@@ -3,10 +3,15 @@
 <package format="3">
   <name>sensor_fusion</name>
   <version>0.1.0</version>
-  <description>Camera-LiDAR fusion: projection.py (LiDAR point &lt;-&gt; pixel, lens model, ground plane, cone boxes; numpy only), lidar_camera_calib.py (camera-LiDAR extrinsic calibration with a checkerboard, Zhang-Pless) + demos.</description>
+  <description>Camera-LiDAR fusion: projection.py (LiDAR point &lt;-&gt; pixel, lens model, ground plane, cone boxes; numpy only), lidar_camera_calib.py (camera-LiDAR extrinsic calibration with a checkerboard, Zhang-Pless), calib_capture / calib_solve (record + solve a session on the car), calib_fake_session (test without hardware) + demos.</description>
   <maintainer email="fatma@todo.todo">fatma</maintainer>
   <license>MIT</license>
 
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>python3-matplotlib</exec_depend>

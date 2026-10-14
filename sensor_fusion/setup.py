@@ -1,3 +1,5 @@
+from glob import glob
+
 from setuptools import find_packages, setup
 
 package_name = 'sensor_fusion'
@@ -9,6 +11,7 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -21,6 +24,9 @@ setup(
         'console_scripts': [
             'projection_demo = sensor_fusion.projection_demo:main',
             'calib_demo = sensor_fusion.calib_demo:main',
+            'calib_capture = sensor_fusion.calib_capture:main',
+            'calib_solve = sensor_fusion.calib_solve:main',
+            'calib_fake_session = sensor_fusion.calib_fake_session:main',
         ],
     },
 )
