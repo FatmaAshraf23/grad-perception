@@ -23,6 +23,9 @@ Test driver speed profile (2026-10-18, racing-speed runs): a_lat (sideways accel
 corners, m/s^2, default 1.5), v_min (default 0.7), a_brake / a_accel (m/s^2; default 0 = the old
 "corner speed 2 m ahead" rule; > 0 = brake early enough at a_brake, accelerate at most a_accel):
     v_max:=6.0 a_lat:=4.0 a_brake:=5.0 a_accel:=4.0
+Sideslip model (2026-10-18, passed to both EKFs and state_estimate): beta_model (steer | slip),
+slip_k (s^2/m; < 0 = from slip_file), slip_file. Default: slip with K from ~/.ros/vehicle_slip.yaml
+(written by slip_calib); beta_model:=steer = the old kinematic model.
 Do NOT run teleop at the same time (both would send drive commands).
 """
 import os
@@ -49,7 +52,10 @@ def generate_launch_description():
                           'sim_sensors': LaunchConfiguration('sim_sensors'),
                           'steer_calib_file': LaunchConfiguration('steer_calib_file'),
                           'track': LaunchConfiguration('track'),
-                          'ekf_test_fault': LaunchConfiguration('ekf_test_fault')}.items(),
+                          'ekf_test_fault': LaunchConfiguration('ekf_test_fault'),
+                          'beta_model': LaunchConfiguration('beta_model'),
+                          'slip_k': LaunchConfiguration('slip_k'),
+                          'slip_file': LaunchConfiguration('slip_file')}.items(),
     )
     driver = Node(
         package='state_estimation', executable='test_driver', name='test_driver', output='screen',
@@ -85,6 +91,9 @@ def generate_launch_description():
         DeclareLaunchArgument('track', default_value='levine'),         # apex_track track (2026-10-06)
         DeclareLaunchArgument('waypoints', default_value=''),           # '' = levine_centerline.csv
         DeclareLaunchArgument('ekf_test_fault', default_value=''),      # TEST ONLY, see sim_localization
+        DeclareLaunchArgument('beta_model', default_value='slip'),      # sideslip model (2026-10-18): slip | steer
+        DeclareLaunchArgument('slip_k', default_value='-1.0'),          # s^2/m; < 0 = from slip_file
+        DeclareLaunchArgument('slip_file', default_value='~/.ros/vehicle_slip.yaml'),
         # CPU rule (also for test_driver and eval_logger, which start here)
         SetEnvironmentVariable('OPENBLAS_NUM_THREADS', LaunchConfiguration('numpy_threads')),
         SetEnvironmentVariable('OMP_NUM_THREADS', LaunchConfiguration('numpy_threads')),

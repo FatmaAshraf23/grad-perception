@@ -78,9 +78,10 @@ def _ekfs_and_state_estimate(context):
     """ekf_local + ekf_global (+ state_estimate): 3 processes, or ONE (pipeline:=merged)."""
     arg = lambda n: LaunchConfiguration(n).perform(context).strip()   # noqa: E731
     yes = lambda n: arg(n).lower() in ('1', 'true', 'yes', 'on')      # noqa: E731
-    common = {'path_period_s': float(arg('ekf_path_period')), 'scale_file': arg('scale_file'),
-              'steer_calib_file': arg('steer_calib_file')}
-    se = {'steer_calib_file': arg('steer_calib_file'), 'track': arg('track')}
+    slip = {'beta_model': arg('beta_model'), 'slip_k': float(arg('slip_k')), 'slip_file': arg('slip_file')}
+    common = dict(slip, **{'path_period_s': float(arg('ekf_path_period')), 'scale_file': arg('scale_file'),
+                           'steer_calib_file': arg('steer_calib_file')})
+    se = dict(slip, **{'steer_calib_file': arg('steer_calib_file'), 'track': arg('track')})
     # LOCAL EKF: odometry for AMCL, starts at the origin of the odom frame
     local = dict(common, **{
         'mode': 'odom', 'frame_id': 'odom', 'child_frame_id': 'est/base_link',
@@ -160,6 +161,10 @@ def generate_launch_description():
         DeclareLaunchArgument('lifecycle', default_value='activator'),
         # steering calibration (steer_calib) for both EKFs + state_estimate; none = no correction
         DeclareLaunchArgument('steer_calib_file', default_value='~/.ros/steering_calibration.yaml'),
+        # sideslip model (2026-10-18, vehicle_model.py): steer | slip; slip_k < 0 = from slip_file
+        DeclareLaunchArgument('beta_model', default_value='slip'),
+        DeclareLaunchArgument('slip_k', default_value='-1.0'),
+        DeclareLaunchArgument('slip_file', default_value='~/.ros/vehicle_slip.yaml'),
         DeclareLaunchArgument('activator_timeout', default_value='2.0'),
         # apex_track track for the StateEstimate (2026-10-06): levine | closed1 | <our track>
         DeclareLaunchArgument('track', default_value='levine'),

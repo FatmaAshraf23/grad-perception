@@ -19,9 +19,11 @@ WHAT IS HONEST AND WHAT IS STILL A PLACEHOLDER (v0, 2026-10-02)
     real    x, y, psi, r, s_abs, s_track, lap, e_y, e_psi, std_xy, std_psi,
             std_e_y, std_e_psi (= sqrt(std_psi^2 + (kappa * std along track)^2)),
             mode, flags, timing fields
-    model   vx, vy from the no-slip KINEMATIC bicycle model at the CG
-            (v = EKF speed, beta = atan(lr/(lf+lr) tan(steering))):
-            vx = v cos(beta), vy = v sin(beta).  FLAG_VY_KINEMATIC is always set.
+    model   vx = v cos(beta), vy = v sin(beta) with the SAME sideslip as the EKF
+            (vehicle_model.py, parameters beta_model / slip_k / slip_file, 2026-10-18):
+            'steer' = no-slip kinematic bicycle from the steering, beta = atan(lr/(lf+lr) tan(steering));
+            'slip'  = from the gyro with rear-tyre slip, vy = r (lr - K vx^2).
+            FLAG_VY_KINEMATIC is set while the model has no tyre slip ('steer', or K = 0).
     rough   std_vx, std_vy, std_r: simple parameter models until the EKF
             exports its own velocity uncertainty (racing-speed work)
     zero    ax, ay ("recommended" fields; not estimated yet)
@@ -61,6 +63,7 @@ from ament_index_python.packages import get_package_share_directory
 from apex_msgs.msg import StateEstimate as SE
 from apex_track import load_track, wrap
 from state_estimation.calibration import load_steering
+from state_estimation.vehicle_model import sideslip_from_params
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
@@ -89,6 +92,9 @@ class StateEstimateNode(Node):
         d('track_yaml', '')                    # '' = apex_track's tracks/<track>/track.yaml
         d('track', 'levine')
         d('lf', 0.15875); d('lr', 0.17145)     # same values as ekf_node (shared vehicle config later)
+        d('beta_model', 'slip')                # same sideslip model as ekf_node (vehicle_model.py)
+        d('slip_k', -1.0)
+        d('slip_file', '~/.ros/vehicle_slip.yaml')
         d('ref_to_cg_m', 0.0)                  # EKF point -> CG along body x (see docstring)
         d('valid_for_ms', 30)
         # provisional thresholds (contract section 6)
@@ -121,6 +127,9 @@ class StateEstimateNode(Node):
             self.get_logger().warn(problem)
         else:
             self.get_logger().info(self.steer_cal.describe())
+        self.sideslip, slip_msg, slip_warn = sideslip_from_params(
+            str(p('beta_model')).strip().lower(), p('lf'), p('lr'), p('slip_k'), p('slip_file'))
+        (self.get_logger().warn if slip_warn else self.get_logger().info)(slip_msg)
 
         self.seq = 0
         self.steer = 0.0
@@ -180,9 +189,8 @@ class StateEstimateNode(Node):
         x = x_r + p('ref_to_cg_m') * c
         y = y_r + p('ref_to_cg_m') * s
 
-        # kinematic body velocities at the CG
-        lf, lr = p('lf'), p('lr')
-        beta = math.atan(lr / (lf + lr) * math.tan(self.steer))
+        # body velocities at the CG, the EKF's sideslip model (vehicle_model)
+        beta = self.sideslip.beta(v, r, self.steer)
         vx, vy = v * math.cos(beta), v * math.sin(beta)
 
         # Frenet (apex_track): continuous s_abs, lap counting, reseed detection
@@ -219,7 +227,7 @@ class StateEstimateNode(Node):
                 self.driven_since_fix += dt_drive
         fix_age = None if self.last_fix_t is None else self.driven_since_fix
         lidar_stale = moving and (fix_age is None or fix_age > p('lidar_stale_s'))
-        flags = SE.FLAG_VY_KINEMATIC
+        flags = SE.FLAG_VY_KINEMATIC if self.sideslip.kinematic else 0
         if lidar_stale:
             flags |= SE.FLAG_LIDAR_STALE
         if self.last_imu_t is not None and now - self.last_imu_t > p('imu_stale_s'):

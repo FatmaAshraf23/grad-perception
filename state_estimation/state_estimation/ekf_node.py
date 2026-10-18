@@ -96,6 +96,20 @@ UPDATE 2 -- AMCL pose (global EKF only)                       NEW in v3
     parameter steer_calib_file; no file = no correction). A +0.01 rad steering
     offset made beta 0.30 deg too large and the heading 0.30 deg too low.
 
+    SIDESLIP MODEL (2026-10-18, vehicle_model.py, parameter beta_model):
+      'steer' = the kinematic beta above (the default until 2026-10-18).
+      'slip'  = DEFAULT since 2026-10-18 (job 152 live A/B, Fatma: "commit it"):
+                beta from the GYRO and the speed with the rear tyres' slip:
+                vy = r * (lr - K * vx^2), beta = atan(vy / vx), r = gyro - bias, vx = k * v_meas.
+      Why: at racing speed the tyres slip, the kinematic beta is too large in fast corners
+      (closed1 sweep job 148: vy error = 0.05 s * v * r, EKF position p95 4 -> 24 cm from 1.5 to
+      6 m/s, inside 2 sigma 54 %). Offline replay (job 151 recordings): 16-22 -> 4-9 cm at
+      3-6 m/s, as good as the TRUE sideslip, 100 % inside 2 sigma. K: slip_k >= 0, or (slip_k < 0)
+      from slip_file (written by slip_calib); no file -> K = 0 + warning. Both EKFs use it (the
+      local one feeds AMCL's odometry). Live A/B closed1 (job 152, K 0.017): EKF position p95
+      14.7 / 20.9 / 23.6 -> 5.1 / 6.8 / 7.6 cm at 3 / 4.5 / 6 m/s, inside 2 sigma 54-66 -> 100 %;
+      1.5 m/s 4.0 -> 5.1 cm (AMCL's own along-track bias no longer cancelled by the old beta error).
+
     RECOVERY = JUMP TO AMCL, ONLY WHEN AMCL IS CLEARLY RIGHT (2026-10-06).
     Before: after `reset_after_rejects` (10) AMCL poses rejected in a row the EKF
     assumed IT was lost and jumped to AMCL. When AMCL was the one that was lost
@@ -394,6 +408,7 @@ try:
     from tf2_ros import TransformBroadcaster
 
     from state_estimation.calibration import load_steering
+    from state_estimation.vehicle_model import sideslip_from_params
 except ImportError:
     Node = object
 
@@ -463,6 +478,10 @@ class EkfNode(Node):
         d('history_s', 2.0)
         # Vehicle geometry for the slip angle
         d('lf', 0.15875); d('lr', 0.17145)
+        # Sideslip model (2026-10-18, docstring SIDESLIP MODEL, vehicle_model.py)
+        d('beta_model', 'slip')             # 'slip' (gyro + rear-tyre slip, default) | 'steer' (kinematic, steering)
+        d('slip_k', -1.0)                   # s^2/m; < 0 = read slip_file (no file -> 0)
+        d('slip_file', '~/.ros/vehicle_slip.yaml')  # written by slip_calib (READ only here)
         # Zero-velocity detection
         d('stopped_speed', 0.01)
         d('stopped_time', 0.3)
@@ -491,6 +510,9 @@ class EkfNode(Node):
             self.get_logger().warn(problem)
         else:
             self.get_logger().info(self.steer_cal.describe())
+        self.sideslip, slip_msg, slip_warn = sideslip_from_params(
+            str(p('beta_model')).strip().lower(), p('lf'), p('lr'), p('slip_k'), p('slip_file'))
+        (self.get_logger().warn if slip_warn else self.get_logger().info)(slip_msg)
         self.ekf = LocalizationEKF(
             x0=[p('x0'), p('y0'), p('yaw0'), 0.0, k0],
             P0_diag=[p('sigma_pos0'), p('sigma_pos0'), math.radians(p('sigma_yaw0_deg')),
@@ -667,8 +689,8 @@ class EkfNode(Node):
             self.ekf.zupt(w_m)
             self.zupt_count += 1
         else:
-            lf, lr = self.get_parameter('lf').value, self.get_parameter('lr').value
-            beta = math.atan(lr / (lf + lr) * math.tan(self.steer))
+            # sideslip (vehicle_model): 'steer' = kinematic from the steering, 'slip' = gyro + tyre slip
+            beta = self.sideslip.beta(self.ekf.x[4] * self.v, w_m - self.ekf.x[3], self.steer)
             self.ekf.predict(self.v, w_m, beta, dt)
             self.distance += abs(self.ekf.x[4] * self.v) * dt
 
