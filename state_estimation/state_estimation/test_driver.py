@@ -19,6 +19,10 @@ Pure pursuit (one control step, 50 Hz):
   2. angle to the goal in the car frame:   alpha
   3. steering for an arc through the goal:  delta = atan(2 L sin(alpha) / Ld)
   4. speed from the curvature of the next ~2 m:  v = min(v_max, sqrt(a_lat / kappa))
+     (racing-speed runs, a_brake > 0, 2026-10-18: a PHYSICS profile instead -- the corner
+     speeds sqrt(a_lat / kappa), then brake early enough at a_brake and accelerate at most
+     a_accel, from v^2 = v0^2 + 2 a s. The old "corner speed 2 m ahead" rule would ask for
+     ~8-9 m/s^2 of braking from 6 m/s, the simulator's limit and far beyond a real 1:10 car.)
 
 Sequence: wait `start_delay` s (still -> ZUPT calibration), drive `laps` laps,
 stop and stay stopped (final ZUPTs). If the car stops moving while commanded
@@ -55,6 +59,30 @@ def speed_profile(wp, v_max, v_min, a_lat, preview_m, spacing):
     v_curve = np.clip(np.sqrt(a_lat / np.maximum(kappa, 1e-6)), v_min, v_max)
     n, k = len(wp), max(1, int(preview_m / spacing))
     return np.array([min(v_curve[(i + j) % n] for j in range(k)) for i in range(n)])
+
+
+def speed_profile_physics(wp, v_max, v_min, a_lat, a_brake, a_accel, spacing):
+    """Racing-speed profile around a LOOP (2026-10-18).
+    1. corner speed at each waypoint:   v = clip(sqrt(a_lat / kappa), v_min, v_max)
+    2. backward pass (brake in time):    v_i <= sqrt(v_{i+1}^2 + 2 a_brake ds)
+    3. forward pass (accelerate):        v_i <= sqrt(v_{i-1}^2 + 2 a_accel ds)   (a_accel > 0)
+    Both passes come from  v^2 = v0^2 + 2 a s  (constant acceleration a over a distance s).
+    The loop wraps around, so the passes are repeated until nothing changes."""
+    kappa = loop_curvature(wp)
+    v = np.clip(np.sqrt(a_lat / np.maximum(kappa, 1e-6)), v_min, v_max)
+    n = len(v)
+    for _ in range(10):
+        old = v.copy()
+        for i in range(2 * n - 1, -1, -1):
+            j = i % n
+            v[j] = min(v[j], math.sqrt(v[(j + 1) % n] ** 2 + 2.0 * a_brake * spacing))
+        if a_accel > 0:
+            for i in range(2 * n):
+                j = i % n
+                v[j] = min(v[j], math.sqrt(v[j - 1] ** 2 + 2.0 * a_accel * spacing))
+        if np.allclose(v, old):
+            break
+    return v
 
 
 def pure_pursuit(x, y, yaw, wp, idx_hint, lookahead, wheelbase, max_steer, search=40):
@@ -106,6 +134,8 @@ class TestDriver(Node):
         d('v_max', 1.5)                     # m/s on straights
         d('v_min', 0.7)                     # m/s in the tightest corners
         d('a_lat', 1.5)                     # m/s^2 allowed sideways acceleration
+        d('a_brake', 0.0)                   # m/s^2; > 0 = physics profile (racing-speed runs)
+        d('a_accel', 0.0)                   # m/s^2; physics profile only, 0 = no limit
         d('lookahead', 0.8)                 # m (+ 0.2 s * speed)
         d('start_delay', 3.0)               # s standing still before driving
         d('wheelbase', 0.3302)
@@ -118,7 +148,18 @@ class TestDriver(Node):
         self.wp = load_waypoints(path)
         spacing = float(np.mean(np.linalg.norm(np.diff(self.wp, axis=0), axis=1)))
         self.loop_len = spacing * len(self.wp)
-        self.v_ref = speed_profile(self.wp, p('v_max'), p('v_min'), p('a_lat'), 2.0, spacing)
+        if p('a_brake') > 0:
+            self.v_ref = speed_profile_physics(self.wp, p('v_max'), p('v_min'), p('a_lat'),
+                                               p('a_brake'), p('a_accel'), spacing)
+            how = (f'physics profile: a_lat {p("a_lat")}, a_brake {p("a_brake")}, '
+                   f'a_accel {p("a_accel")} m/s^2')
+        else:
+            self.v_ref = speed_profile(self.wp, p('v_max'), p('v_min'), p('a_lat'), 2.0, spacing)
+            how = f'corner speed 2 m ahead, a_lat {p("a_lat")} m/s^2'
+        lap_s = float(np.sum(spacing / self.v_ref))
+        self.get_logger().info(
+            f'speed profile ({how}): {self.v_ref.min():.2f} .. {self.v_ref.max():.2f} m/s, '
+            f'mean {self.loop_len / lap_s:.2f} m/s, lap ~{lap_s:.1f} s if followed exactly')
 
         self.pose = None
         self.speed = 0.0

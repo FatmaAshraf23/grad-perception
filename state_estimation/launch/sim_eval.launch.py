@@ -19,6 +19,10 @@ and waypoints (the test driver's path, '' = levine_centerline.csv) -- 2026-10-06
     (the simulator must run the same map: sim_perception.launch.py config:=<sim yaml with that map>)
 ekf_test_fault (TEST ONLY, 2026-10-06): 't_s,dx,dy,dyaw_deg' moves ekf_global's pose once -> tests
 the robust jump to AMCL; '' (default) = off.
+Test driver speed profile (2026-10-18, racing-speed runs): a_lat (sideways acceleration allowed in
+corners, m/s^2, default 1.5), v_min (default 0.7), a_brake / a_accel (m/s^2; default 0 = the old
+"corner speed 2 m ahead" rule; > 0 = brake early enough at a_brake, accelerate at most a_accel):
+    v_max:=6.0 a_lat:=4.0 a_brake:=5.0 a_accel:=4.0
 Do NOT run teleop at the same time (both would send drive commands).
 """
 import os
@@ -51,6 +55,10 @@ def generate_launch_description():
         package='state_estimation', executable='test_driver', name='test_driver', output='screen',
         parameters=[{'laps': ParameterValue(LaunchConfiguration('laps'), value_type=int),
                      'v_max': ParameterValue(LaunchConfiguration('v_max'), value_type=float),
+                     'v_min': ParameterValue(LaunchConfiguration('v_min'), value_type=float),
+                     'a_lat': ParameterValue(LaunchConfiguration('a_lat'), value_type=float),
+                     'a_brake': ParameterValue(LaunchConfiguration('a_brake'), value_type=float),
+                     'a_accel': ParameterValue(LaunchConfiguration('a_accel'), value_type=float),
                      'waypoints': ParameterValue(LaunchConfiguration('waypoints'), value_type=str)}],
     )
     logger = Node(
@@ -62,6 +70,10 @@ def generate_launch_description():
         DeclareLaunchArgument('run_name', default_value='run'),
         DeclareLaunchArgument('laps', default_value='3'),
         DeclareLaunchArgument('v_max', default_value='1.5'),
+        DeclareLaunchArgument('v_min', default_value='0.7'),
+        DeclareLaunchArgument('a_lat', default_value='1.5'),
+        DeclareLaunchArgument('a_brake', default_value='0.0'),       # 0 = old 2-m preview rule
+        DeclareLaunchArgument('a_accel', default_value='0.0'),       # 0 = no acceleration limit
         DeclareLaunchArgument('amcl_min_sigma_pos', default_value='0.10'),
         DeclareLaunchArgument('scale_file', default_value='~/.ros/ekf_speed_scale.yaml'),
         DeclareLaunchArgument('numpy_threads', default_value='1'),
