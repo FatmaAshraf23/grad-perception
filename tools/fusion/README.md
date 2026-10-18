@@ -57,3 +57,30 @@ found in 93-100 % of the pictures (box centre error median 2.5-3.7 px); the cone
 boxed; 29 false boxes. Fusion preview: 78 % of the LiDAR obstacles in view land in a box, 87 % of the cone boxes
 contain a LiDAR obstacle; offset median 2.6 px / p95 9.8 px horizontally, mostly the localization error (3.0 / 9.2 px
 alone) -> the association gate must allow about 1 deg plus the heading uncertainty.
+
+## fake_mjpeg_server.py + camera_node_check.py -- does camera_node stamp and publish every picture once?
+
+No camera needed. `fake_mjpeg_server.py` serves a stream exactly like the Windows `camera_server.py` (Flask,
+multipart JPEG, boundary `frame`); every picture carries its NUMBER as 16 black/white blocks and the server logs
+the moment it sent each picture. `camera_node_check.py` subscribes to `/camera/image_compressed`, reads the numbers
+and compares each message's stamp with the send time: messages per second, duplicates (the same picture
+published again), skipped pictures, stamp - send time, delivery time, stamps going backwards, outages.
+
+    python3 ~/ros2_ws/src/tools/fusion/fake_mjpeg_server.py --port 5055 --fps 20 --log /tmp/send.csv &
+    python3 ~/ros2_ws/src/tools/fusion/camera_node_check.py --send-log /tmp/send.csv --seconds 20 --out /tmp/check &
+    ros2 run camera_publisher camera_node --ros-args -p url:=http://127.0.0.1:5055/video
+
+Server options: `--content-length` (send each part's length, see below), `--stall-after N` (stop sending after N
+pictures but keep the connection open = a frozen stream, for the Ctrl+C test), `--start-index K` (number the
+pictures from K, e.g. after a restart = reconnect test), `--jitter-ms`. `--require-clean` makes the checker exit
+with code 2 if it saw duplicates, backwards stamps or unreadable pictures.
+
+2026-10-18 (20 pictures/s, jitter 5 ms; runner job 147): the OLD camera_node published 30 messages/s with 33 %
+duplicates (each copy stamped 33 ms later), stamp - send 70 ms median (52-91); the NEW camera_node publishes each
+picture once when it arrives: 20 messages/s, 0 duplicates, 52 ms (41-63) = one picture interval, see below; with
+Content-Length 1.6 ms (0.8-2.5). Ctrl+C on a frozen stream: old 3 of 3 segmentation faults, new 3 of 3 clean exits.
+
+Why one picture interval without Content-Length: OpenCV reads the stream with FFmpeg's MJPEG reader. When a part
+does not say how long it is, the reader can only end a picture when the NEXT part's boundary arrives, so every
+picture is delivered one interval late (50 ms at 20 pictures/s). Fix: send `Content-Length` in every part (the
+Windows `camera_server.py` does since 2026-10-18).
