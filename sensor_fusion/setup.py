@@ -17,7 +17,7 @@ setup(
     zip_safe=True,
     maintainer='fatma',
     maintainer_email='fatma@todo.todo',
-    description='Camera-LiDAR fusion: projection (LiDAR point <-> pixel), camera-LiDAR extrinsic calibration + demos',
+    description='Camera-LiDAR fusion: projection (LiDAR point <-> pixel), camera-LiDAR extrinsic calibration, fake camera, camera latency test + demos',
     license='MIT',
     tests_require=['pytest'],
     entry_points={
@@ -28,6 +28,8 @@ setup(
             'calib_solve = sensor_fusion.calib_solve:main',
             'calib_fake_session = sensor_fusion.calib_fake_session:main',
             'fake_camera = sensor_fusion.fake_camera:main',
+            'latency_probe = sensor_fusion.latency_probe:main',
+            'flash_window = sensor_fusion.flash_window:main',
         ],
     },
 )

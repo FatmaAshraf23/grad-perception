@@ -37,7 +37,7 @@ recording of it:
 4. FUSION PREVIEW: the LiDAR obstacles (`/obstacles`) projected into each picture with the ESTIMATED pose -> how many
    land inside a camera box, and the pixel offset (what the fusion node's association gate must allow)
 
-Recording (simulator with a cone world; `tools/make_cone_world.py` makes one, e.g. `~/apex_maps/closed1_cones/`):
+Recording (simulator with a cone world; `lidar_perception/tools/make_cone_world.py` makes one, e.g. `~/apex_maps/closed1_cones/`):
 
     ros2 launch lidar_perception sim_perception.launch.py config:=<cone world>/sim_closed1_cones.yaml car_map:=<car map>.yaml
     ros2 launch lidar_perception obstacles.launch.py track:=closed1 range_offset:=0.022    # the simulator LiDAR's offset
