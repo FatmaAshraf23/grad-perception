@@ -10,7 +10,7 @@ amcl:
     odom_frame_id: "odom"
     base_frame_id: "est/base_link"
     scan_topic: "/scan_amcl"
-    map_topic: "/map"
+    map_topic: "/map"             # sim_localization: /map_amcl = thin-wall copy (amcl_map.py)
     tf_broadcast: true            # AMCL publishes map -> odom
     transform_tolerance: 0.3      # s
 
@@ -28,24 +28,31 @@ amcl:
     # --- Motion model: how much noise to add when moving the particles ---
     # alpha1: rotation noise from rotation, alpha2: rotation noise from
     # translation, alpha3: translation noise from translation, alpha4:
-    # translation noise from rotation.
-    # 2026-10-06: 0.1 -> 0.02 (jobs 058-063: offline AMCL replays of the same
-    # recorded laps, tools in runner/tools). With 0.1 AMCL assumed the odometry
-    # distance could be ~30 % wrong per step. In the long featureless corridors
-    # (the walls show nothing along the corridor) its particle cloud then slid
-    # BACKWARDS, up to 38 cm behind at the corridor end, and dragged the EKF:
-    # the big along-track (s) error in Corner 1. Our odometry (ekf_local:
-    # calibrated wheel speed + gyro) is far better than that. Replays, 0.1 ->
-    # 0.02: AMCL along-track p95 28 -> 8 cm (no slide), EKF s p95 8.4 -> 4.5 cm,
-    # Corner 1 13 -> 6 cm, EKF still honest (95 % inside 2 sigma). 0.01/0.005
-    # are as accurate but make AMCL and then the EKF overconfident (87/83 %).
+    # translation noise from rotation (variances: alpha * step^2 per update).
+    # 2026-10-06: 0.1 -> 0.02 (jobs 058-063, offline AMCL replays): AMCL's
+    # particle cloud slid BACKWARDS in the long corridors (up to 38 cm).
+    # 2026-10-19: alpha1 0.005, alpha2 0.0005, alpha4 0.005 (alpha3 stays 0.02).
+    # WHY (AMCL-sliding work, jobs 154-158; a Python replica of nav2 AMCL found
+    # it): AMCL updates only every scan (7 per s), i.e. every ~0.85 m at 6 m/s.
+    # alpha2 = 0.02 turned every particle's direction by a random +-7 deg on
+    # every update. A particle that zig-zags covers less ground ALONG the track
+    # than one going straight (cos effect), so the cloud's centre fell behind
+    # the car on every straight -- even with PERFECT odometry (job 156: still
+    # ~6 cm behind). Our odometry's heading comes from the gyro: ~100x better
+    # than that noise. The translation noise alpha3 is what lets AMCL fix an
+    # along-track error of the odometry (wheel slip, delay), so it stays.
+    # Offline replays (job-154 laps, the same scans, odometry with the wheel-
+    # delay compensation, thin-wall map): AMCL along-track at 6 m/s mean / p95
+    # -3.7 / 12.5 -> -1.1 / 7.7 cm, heading p95 1.5 -> 0.6 deg; EKF position
+    # p95 9.7 -> 4.9 cm, still 100 % inside 2 sigma.
     # REAL CAR: re-check with the replay bench on a real recording -- wheel slip
-    # and servo play make real odometry worse than the simulator's.
+    # and servo play make real odometry worse than the simulator's (if AMCL
+    # lags at hard acceleration/braking: raise alpha3; if it is jumpy: lower it).
     robot_model_type: "nav2_amcl::DifferentialMotionModel"
-    alpha1: 0.02
-    alpha2: 0.02
+    alpha1: 0.005
+    alpha2: 0.0005
     alpha3: 0.02
-    alpha4: 0.02
+    alpha4: 0.005
     alpha5: 0.0
 
     # --- Sensor model: how a scan is scored against the wall map ---

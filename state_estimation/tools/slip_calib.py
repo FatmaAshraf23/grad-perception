@@ -23,6 +23,10 @@ RUN:
 Inputs: rosbag2 folders (needs rosbag2_py, i.e. ROS sourced) or bag_to_csv.py folders (imu.csv,
 wheel.csv, amcl.csv; plain numpy).  The EKF settings default to ekf_node's; the speed scale k is read
 from the wheel_calib anchor file (--scale-file).
+--wheel-delay (2026-10-19): the SAME wheel_delay_s the node runs with (wheel-speed delay compensation,
+wheel_delay.py; -1 = off).  K must be fitted on the odometry the EKF really uses: braking into a corner
+with a late wheel speed looks like a different sideslip.  Real-car order: wheel_calib -> wheel_delay_calib
+-> slip_calib --wheel-delay <that value>.
 """
 import argparse
 import csv
@@ -36,16 +40,18 @@ import numpy as np
 try:
     from state_estimation.ekf_node import CHI2_3DOF_99, LocalizationEKF, StateHistory, amcl_measurement_noise, wrap
     from state_estimation.vehicle_model import Sideslip
+    from state_estimation.wheel_delay import WheelSpeedCompensator
 except ImportError:                                   # from the source tree (tests, no install)
     here = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(here, '..', 'state_estimation'))
     from ekf_node import CHI2_3DOF_99, LocalizationEKF, StateHistory, amcl_measurement_noise, wrap
     from vehicle_model import Sideslip
+    from wheel_delay import WheelSpeedCompensator
 
 EKF = dict(sigma_pos0=0.1, sigma_yaw0_deg=2.0, sigma_bias0=0.05, sigma_v=0.05, sigma_w=0.005,
            sigma_bw=0.0001, sigma_kw=0.0005, amcl_cov_scale=4.0, amcl_min_sigma_pos=0.10,
            amcl_min_sigma_yaw_deg=1.0, gate=CHI2_3DOF_99, history_s=2.0, stopped_speed=0.01,
-           stopped_time=0.3, k0=1.0, sigma_k0=0.01, amcl_offset_m=0.025)
+           stopped_time=0.3, k0=1.0, sigma_k0=0.01, amcl_offset_m=0.025, wheel_delay_s=-1.0)
 
 
 # ------------------------------------------------------------------ reading a recording
@@ -71,7 +77,7 @@ def _read_bag(path):
         rx = t_rx * 1e-9
         if topic == '/imu/data':
             m = deserialize_message(data, types[topic])
-            rows['imu'].append([st(m.header.stamp), rx, m.angular_velocity.z])
+            rows['imu'].append([st(m.header.stamp), rx, m.angular_velocity.z, m.linear_acceleration.x])
         elif topic == '/vehicle/measured':
             m = deserialize_message(data, types[topic])
             rows['wheel'].append([st(m.header.stamp), rx, m.drive.speed, m.drive.steering_angle])
@@ -80,7 +86,7 @@ def _read_bag(path):
             p, c, q = m.pose.pose, m.pose.covariance, m.pose.pose.orientation
             yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
             rows['amcl'].append([st(m.header.stamp), rx, p.position.x, p.position.y, yaw, c[0], c[1], c[7], c[35]])
-    cols = {'imu': ['stamp', 'rx', 'wz'], 'wheel': ['stamp', 'rx', 'speed', 'steer'],
+    cols = {'imu': ['stamp', 'rx', 'wz', 'ax'], 'wheel': ['stamp', 'rx', 'speed', 'steer'],
             'amcl': ['stamp', 'rx', 'x', 'y', 'yaw', 'cxx', 'cxy', 'cyy', 'cyaw']}
     out = {}
     for k, v in rows.items():
@@ -109,6 +115,9 @@ def replay(rec, K, lf, lr, prm):
                  prm['sigma_bias0'], prm['sigma_k0']],
         sigma_v=prm['sigma_v'], sigma_w=prm['sigma_w'], sigma_bw=prm['sigma_bw'], sigma_kw=prm['sigma_kw'])
     slip = Sideslip('slip', lf, lr, K)
+    comp = WheelSpeedCompensator(prm['wheel_delay_s']) if prm.get('wheel_delay_s', -1.0) >= 0.0 else None
+    if comp is not None and 'ax' not in im:
+        raise ValueError('--wheel-delay needs the IMU forward acceleration (imu.csv column ax)')
     hist = StateHistory(prm['history_s'])
     ev = sorted([(im['rx'][i], 0, i) for i in range(len(im['rx']))]
                 + [(wh['rx'][i], 1, i) for i in range(len(wh['rx']))]
@@ -120,6 +129,8 @@ def replay(rec, K, lf, lr, prm):
         if kind == 1:
             v = wh['speed'][i]
             t = wh['stamp'][i]
+            if comp is not None:
+                comp.on_wheel(t)
             if abs(v) < prm['stopped_speed']:
                 stopped_since = t if stopped_since is None else stopped_since
             else:
@@ -133,11 +144,15 @@ def replay(rec, K, lf, lr, prm):
             if dt <= 0 or dt > 0.5:
                 continue
             w = im['wz'][i]
-            if stopped_since is not None and t - stopped_since >= prm['stopped_time']:
+            stopped = stopped_since is not None and t - stopped_since >= prm['stopped_time']
+            vv = v                                    # as ekf_node.imu_cb: + the delay compensation (if on)
+            if comp is not None:
+                vv = v + comp.on_imu(t, im['ax'][i], dt, stopped) / max(float(ekf.x[4]), 0.5)
+            if stopped:
                 ekf.stationary_predict(dt)
                 ekf.zupt(w)
             else:
-                ekf.predict(v, w, slip.beta(ekf.x[4] * v, w - ekf.x[3]), dt)
+                ekf.predict(vv, w, slip.beta(ekf.x[4] * vv, w - ekf.x[3]), dt)
             hist.add(int(round(t * 1e9)), ekf.x)
         else:
             x_then = hist.at(int(round(am['stamp'][i] * 1e9)))
@@ -215,9 +230,13 @@ def main(argv=None):
     ap.add_argument('--min-excitation', type=float, default=0.05,
                     help='minimum share of driving time above 2.5 m/s^2 sideways (default 5 %%)')
     ap.add_argument('--write', help='calibration file to write, e.g. ~/.ros/vehicle_slip.yaml')
+    ap.add_argument('--wheel-delay', type=float, default=-1.0,
+                    help="the node's wheel_delay_s (wheel-speed delay compensation, s; -1 = off)")
     a = ap.parse_args(argv)
 
-    prm = dict(EKF, amcl_offset_m=a.amcl_offset)
+    prm = dict(EKF, amcl_offset_m=a.amcl_offset, wheel_delay_s=a.wheel_delay)
+    print('wheel-speed delay compensation: ' + (f'ON, {1000 * a.wheel_delay:.1f} ms (as the node)' if a.wheel_delay >= 0
+                                                else 'off'))
     k_scale = None if a.scale_file.lower() == 'none' else read_scale(a.scale_file)
     prm['k0'] = k_scale if k_scale else 1.0
     print(f'speed scale k0 = {prm["k0"]:.4f}' + ('' if k_scale else ' (no wheel_calib file -- run wheel_calib first on the car)'))
@@ -258,6 +277,7 @@ def main(argv=None):
             f.write(f'slip_k: {r["k"]:.6f}\n')
             f.write(f'slip_k_sigma: {sigma:.6f}\n')
             f.write(f'lf: {a.lf}\nlr: {a.lr}\nspeed_scale_used: {prm["k0"]:.6f}\n')
+            f.write(f'wheel_delay_used: {a.wheel_delay}\n')
             f.write(f'recordings: {"; ".join(ok)}\n')
             f.write(f"saved: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         os.replace(tmp, path)

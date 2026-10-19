@@ -110,6 +110,21 @@ UPDATE 2 -- AMCL pose (global EKF only)                       NEW in v3
       14.7 / 20.9 / 23.6 -> 5.1 / 6.8 / 7.6 cm at 3 / 4.5 / 6 m/s, inside 2 sigma 54-66 -> 100 %;
       1.5 m/s 4.0 -> 5.1 cm (AMCL's own along-track bias no longer cancelled by the old beta error).
 
+    WHEEL-SPEED DELAY COMPENSATION (2026-10-19, wheel_delay.py, parameter wheel_delay_s):
+      The wheel speed is late: its own delay (an encoder speed = counts over a window -> it describes
+      the window's middle; + the link; simulator 10-12 ms) + the EKF holds each value until the next
+      one (0-20 ms at 50 Hz). Accelerating, the integrated distance falls behind by (speed gained) x
+      (delay), ~6 cm from 2 to 6 m/s, invisible on a featureless straight -- and ekf_local is AMCL's
+      odometry, so AMCL's particles fell behind too (it was the speed-dependent part of AMCL's
+      along-track slide). Now: v = v_wheel + integral of the IMU's forward acceleration (minus its
+      bias, learned while standing) since the moment the wheel value was true, i.e. over
+      [t_wheel - wheel_delay_s, now] -- only 10-30 ms, restarted at every wheel message.
+      wheel_delay_s < 0 = off (the node default); >= 0 = on (the simulator launch: 0.010; real car:
+      measure it). imu_yaw_deg = how the IMU's x axis is turned against the car's forward axis (0 =
+      x forward). The compensated speed is also the published twist (-> StateEstimate vx).
+      Offline (job-154 recordings, the same scans): AMCL along-track at 6 m/s mean -8.2 -> -4.8 cm,
+      p95 17.8 -> 12.8 cm; the error no longer grows with speed.
+
     RECOVERY = JUMP TO AMCL, ONLY WHEN AMCL IS CLEARLY RIGHT (2026-10-06).
     Before: after `reset_after_rejects` (10) AMCL poses rejected in a row the EKF
     assumed IT was lost and jumped to AMCL. When AMCL was the one that was lost
@@ -142,7 +157,8 @@ UPDATE 2 -- AMCL pose (global EKF only)                       NEW in v3
     AMCL is fine, to test the jump live.
 
 Topics
-  in : /imu/data, /vehicle/measured, /amcl_pose (global), /initialpose (global)
+  in : /imu/data (gyro z; + accel x/y with wheel_delay_s >= 0), /vehicle/measured,
+       /amcl_pose (global), /initialpose (global)
        <map_topic> (global, read once: checks amcl_offset_m against the resolution;
                     the walls for the scan check), <scan_topic> (global, scan check)
        <truth_topic> (global, simulation truth for the 2-s report only;
@@ -409,6 +425,7 @@ try:
 
     from state_estimation.calibration import load_steering
     from state_estimation.vehicle_model import sideslip_from_params
+    from state_estimation.wheel_delay import WheelSpeedCompensator
 except ImportError:
     Node = object
 
@@ -482,6 +499,9 @@ class EkfNode(Node):
         d('beta_model', 'slip')             # 'slip' (gyro + rear-tyre slip, default) | 'steer' (kinematic, steering)
         d('slip_k', -1.0)                   # s^2/m; < 0 = read slip_file (no file -> 0)
         d('slip_file', '~/.ros/vehicle_slip.yaml')  # written by slip_calib (READ only here)
+        # Wheel-speed delay compensation (2026-10-19, docstring WHEEL-SPEED DELAY COMPENSATION)
+        d('wheel_delay_s', -1.0)            # s: the wheel speed's own delay; < 0 = compensation OFF
+        d('imu_yaw_deg', 0.0)               # deg: IMU x axis vs the car's forward axis (CCW); 0 = x forward
         # Zero-velocity detection
         d('stopped_speed', 0.01)
         d('stopped_time', 0.3)
@@ -513,6 +533,11 @@ class EkfNode(Node):
         self.sideslip, slip_msg, slip_warn = sideslip_from_params(
             str(p('beta_model')).strip().lower(), p('lf'), p('lr'), p('slip_k'), p('slip_file'))
         (self.get_logger().warn if slip_warn else self.get_logger().info)(slip_msg)
+        tau_w = float(p('wheel_delay_s'))
+        self.wheel_comp = WheelSpeedCompensator(tau_w) if tau_w >= 0.0 else None
+        self.imu_c, self.imu_s = math.cos(math.radians(p('imu_yaw_deg'))), math.sin(math.radians(p('imu_yaw_deg')))
+        self.get_logger().info(self.wheel_comp.describe() if self.wheel_comp is not None
+                               else 'wheel-speed delay compensation OFF (wheel_delay_s < 0)')
         self.ekf = LocalizationEKF(
             x0=[p('x0'), p('y0'), p('yaw0'), 0.0, k0],
             P0_diag=[p('sigma_pos0'), p('sigma_pos0'), math.radians(p('sigma_yaw0_deg')),
@@ -522,6 +547,7 @@ class EkfNode(Node):
         self.history = StateHistory(p('history_s'))
 
         self.v = 0.0
+        self.v_used = 0.0                   # the speed the EKF predicts with (v + delay compensation)
         self.steer = 0.0
         self.stopped_since = None
         self.last_imu_t = None
@@ -661,6 +687,8 @@ class EkfNode(Node):
         self.v = msg.drive.speed
         self.steer = self.steer_cal.correct(msg.drive.steering_angle)
         now = Time.from_msg(msg.header.stamp)
+        if self.wheel_comp is not None:
+            self.wheel_comp.on_wheel(now.nanoseconds * 1e-9)
         if abs(self.v) < self.get_parameter('stopped_speed').value:
             if self.stopped_since is None:
                 self.stopped_since = now
@@ -683,16 +711,22 @@ class EkfNode(Node):
         if dt <= 0.0 or dt > 0.5:
             return
         w_m = msg.angular_velocity.z
+        stopped = self.is_stopped(t)
+        self.v_used = self.v
+        if self.wheel_comp is not None:     # speed gained since the wheel value was true (true m/s)
+            a = msg.linear_acceleration
+            dv = self.wheel_comp.on_imu(t.nanoseconds * 1e-9, self.imu_c * a.x - self.imu_s * a.y, dt, stopped)
+            self.v_used = self.v + dv / max(float(self.ekf.x[4]), 0.5)      # raw units, as v
 
-        if self.is_stopped(t):
+        if stopped:
             self.ekf.stationary_predict(dt)
             self.ekf.zupt(w_m)
             self.zupt_count += 1
         else:
             # sideslip (vehicle_model): 'steer' = kinematic from the steering, 'slip' = gyro + tyre slip
-            beta = self.sideslip.beta(self.ekf.x[4] * self.v, w_m - self.ekf.x[3], self.steer)
-            self.ekf.predict(self.v, w_m, beta, dt)
-            self.distance += abs(self.ekf.x[4] * self.v) * dt
+            beta = self.sideslip.beta(self.ekf.x[4] * self.v_used, w_m - self.ekf.x[3], self.steer)
+            self.ekf.predict(self.v_used, w_m, beta, dt)
+            self.distance += abs(self.ekf.x[4] * self.v_used) * dt
 
         if self.fault is not None:                  # TEST ONLY (test_fault)
             if self.fault_t0 is None:
@@ -863,7 +897,7 @@ class EkfNode(Node):
         cov[6], cov[7], cov[11] = P[1, 0], P[1, 1], P[1, 2]
         cov[30], cov[31], cov[35] = P[2, 0], P[2, 1], P[2, 2]
         odom.pose.covariance = [float(c) for c in cov]
-        odom.twist.twist.linear.x = k * self.v
+        odom.twist.twist.linear.x = k * self.v_used          # with the delay compensation (if on)
         odom.twist.twist.angular.z = float(w_m) - b
         self.odom_pub.publish(odom)
         for hook in self.odom_hooks:

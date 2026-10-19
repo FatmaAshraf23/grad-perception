@@ -26,6 +26,9 @@ corners, m/s^2, default 1.5), v_min (default 0.7), a_brake / a_accel (m/s^2; def
 Sideslip model (2026-10-18, passed to both EKFs and state_estimate): beta_model (steer | slip),
 slip_k (s^2/m; < 0 = from slip_file), slip_file. Default: slip with K from ~/.ros/vehicle_slip.yaml
 (written by slip_calib); beta_model:=steer = the old kinematic model.
+AMCL along-track slide (2026-10-19, passed to sim_localization): wheel_delay (s, the wheel speed's own
+delay for both EKFs' delay compensation; default 0.010 = the simulator; -1 = off) and amcl_thin_walls
+(default true: AMCL on its thin-wall copy of the map; false = the old /map).
 Do NOT run teleop at the same time (both would send drive commands).
 """
 import os
@@ -55,7 +58,9 @@ def generate_launch_description():
                           'ekf_test_fault': LaunchConfiguration('ekf_test_fault'),
                           'beta_model': LaunchConfiguration('beta_model'),
                           'slip_k': LaunchConfiguration('slip_k'),
-                          'slip_file': LaunchConfiguration('slip_file')}.items(),
+                          'slip_file': LaunchConfiguration('slip_file'),
+                          'wheel_delay': LaunchConfiguration('wheel_delay'),
+                          'amcl_thin_walls': LaunchConfiguration('amcl_thin_walls')}.items(),
     )
     driver = Node(
         package='state_estimation', executable='test_driver', name='test_driver', output='screen',
@@ -94,6 +99,8 @@ def generate_launch_description():
         DeclareLaunchArgument('beta_model', default_value='slip'),      # sideslip model (2026-10-18): slip | steer
         DeclareLaunchArgument('slip_k', default_value='-1.0'),          # s^2/m; < 0 = from slip_file
         DeclareLaunchArgument('slip_file', default_value='~/.ros/vehicle_slip.yaml'),
+        DeclareLaunchArgument('wheel_delay', default_value='0.010'),    # s, -1 = off (2026-10-19)
+        DeclareLaunchArgument('amcl_thin_walls', default_value='true'), # AMCL on /map_amcl (2026-10-19)
         # CPU rule (also for test_driver and eval_logger, which start here)
         SetEnvironmentVariable('OPENBLAS_NUM_THREADS', LaunchConfiguration('numpy_threads')),
         SetEnvironmentVariable('OMP_NUM_THREADS', LaunchConfiguration('numpy_threads')),

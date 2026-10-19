@@ -37,6 +37,7 @@ setup(
             'state_pipeline = state_estimation.state_pipeline:main',
             'lifecycle_activator = state_estimation.lifecycle_activator:main',
             'steer_calib = state_estimation.steer_calib:main',
+            'amcl_map_filter = state_estimation.amcl_map:main',
         ],
     },
 )

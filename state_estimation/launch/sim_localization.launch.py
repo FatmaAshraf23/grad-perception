@@ -41,6 +41,16 @@ track (2026-10-06): apex_track track the StateEstimate projects onto (Frenet s, 
 lifecycle (2026-10-03): who switches AMCL on. activator (default) = our lifecycle_activator,
   which re-reads AMCL's state and retries when a reply is lost; nav2 = nav2's lifecycle
   manager, which waited forever when its first reply was lost (jobs 040/041).
+AMCL along-track slide (2026-10-19, see ekf_node / amcl_map.py / amcl_sim.yaml):
+  wheel_delay (s): the wheel speed's own delay for both EKFs' delay compensation (ekf_node
+    wheel_delay_s): simulator 0.010 (default here); real car: measure it; -1 = off (the old odometry).
+  amcl_thin_walls (true): AMCL gets its own copy of /map with only the wall SURFACE occupied
+    (node amcl_map_filter -> /map_amcl); the EKF's scan check and the obstacle detector keep /map.
+    false = AMCL on /map (the old behaviour).
+  amcl_offset (0.025 m = half the map cell): nav2 AMCL's map is shifted by half a cell; the global EKF
+    adds it to AMCL's poses (ekf_node amcl_offset_m) and AMCL's START pose gets it subtracted, so AMCL
+    starts exactly where the car is. (Its particles start with no spread; with the small alphas a
+    2.5 cm start error took until the first corner to disappear.)
 """
 import os
 import tempfile
@@ -80,7 +90,8 @@ def _ekfs_and_state_estimate(context):
     yes = lambda n: arg(n).lower() in ('1', 'true', 'yes', 'on')      # noqa: E731
     slip = {'beta_model': arg('beta_model'), 'slip_k': float(arg('slip_k')), 'slip_file': arg('slip_file')}
     common = dict(slip, **{'path_period_s': float(arg('ekf_path_period')), 'scale_file': arg('scale_file'),
-                           'steer_calib_file': arg('steer_calib_file')})
+                           'steer_calib_file': arg('steer_calib_file'),
+                           'wheel_delay_s': float(arg('wheel_delay'))})
     se = dict(slip, **{'steer_calib_file': arg('steer_calib_file'), 'track': arg('track')})
     # LOCAL EKF: odometry for AMCL, starts at the origin of the odom frame
     local = dict(common, **{
@@ -92,7 +103,7 @@ def _ekfs_and_state_estimate(context):
     # GLOBAL EKF: the pose planning/MPC will use
     glob = dict(common, **{
         'mode': 'map', 'frame_id': 'map', 'child_frame_id': 'est/base_link',
-        'publish_tf': False, 'use_amcl': yes('use_amcl'),
+        'publish_tf': False, 'use_amcl': yes('use_amcl'), 'amcl_offset_m': float(arg('amcl_offset')),
         'amcl_min_sigma_pos': float(arg('amcl_min_sigma_pos')),
         'x0': float(arg('x0')), 'y0': float(arg('y0')), 'yaw0': float(arg('yaw0')),
         'odom_topic': '/odom/ekf', 'path_topic': '/odom/ekf_path',
@@ -123,14 +134,31 @@ def _ekfs_and_state_estimate(context):
     return actions
 
 
+def _amcl(context):
+    """AMCL on /map, or (amcl_thin_walls:=true) on its thin-wall copy /map_amcl made by amcl_map_filter."""
+    arg = lambda n: LaunchConfiguration(n).perform(context).strip()   # noqa: E731
+    thin = arg('amcl_thin_walls').lower() in ('1', 'true', 'yes', 'on')
+    off = float(arg('amcl_offset'))                 # AMCL's frame = the true map shifted by half a cell
+    amcl_yaml = os.path.join(get_package_share_directory('state_estimation'), 'config', 'amcl_sim.yaml')
+    actions = []
+    if thin:
+        actions.append(Node(package='state_estimation', executable='amcl_map_filter', name='amcl_map_filter',
+                            output='screen', parameters=[{'in_topic': '/map', 'out_topic': '/map_amcl'}]))
+    # map_topic picks AMCL's map; the remapping makes sure even if an AMCL version ignored map_topic
+    actions.append(Node(package='nav2_amcl', executable='amcl', name='amcl', output='screen',
+                        parameters=[amcl_yaml, {'initial_pose.x': float(arg('x0')) - off,
+                                                'initial_pose.y': float(arg('y0')) - off,
+                                                'initial_pose.yaw': float(arg('yaw0')),
+                                                'map_topic': '/map_amcl' if thin else '/map'}],
+                        remappings=[('/map', '/map_amcl')] if thin else []))
+    return actions
+
+
 def generate_launch_description():
     x0 = LaunchConfiguration('x0')
     y0 = LaunchConfiguration('y0')
     yaw0 = LaunchConfiguration('yaw0')
     f = lambda s: ParameterValue(s, value_type=float)  # noqa: E731
-
-    amcl_yaml = os.path.join(get_package_share_directory('state_estimation'),
-                             'config', 'amcl_sim.yaml')
 
     def se(name, executable=None, params=None):
         return Node(package='state_estimation', executable=executable or name, name=name,
@@ -171,6 +199,11 @@ def generate_launch_description():
         # TEST ONLY (2026-10-06): 't_s,dx,dy,dyaw_deg' moves ekf_global's pose once, t_s s after its
         # first IMU message -> tests the robust jump to AMCL (ekf_node RECOVERY). '' = off (always, normally)
         DeclareLaunchArgument('ekf_test_fault', default_value=''),
+        # AMCL along-track slide (2026-10-19, docstring): wheel-speed delay [s] for both EKFs
+        # (-1 = compensation off) and AMCL's thin-wall map copy
+        DeclareLaunchArgument('wheel_delay', default_value='0.010'),
+        DeclareLaunchArgument('amcl_thin_walls', default_value='true'),
+        DeclareLaunchArgument('amcl_offset', default_value='0.025'),   # m, half the map cell (docstring)
 
         # CPU rule: limit numpy's math-library threads for every node below
         SetEnvironmentVariable('OPENBLAS_NUM_THREADS', LaunchConfiguration('numpy_threads')),
@@ -189,10 +222,8 @@ def generate_launch_description():
         # Scan in the estimated car's frame (simulation only)
         se('sim_scan_relay'),
 
-        # AMCL (a lifecycle node, started by its lifecycle manager)
-        Node(package='nav2_amcl', executable='amcl', name='amcl', output='screen',
-             parameters=[amcl_yaml, {'initial_pose.x': f(x0), 'initial_pose.y': f(y0),
-                                     'initial_pose.yaw': f(yaw0)}]),
+        # AMCL (a lifecycle node, started by its lifecycle manager) + its thin-wall map (_amcl)
+        OpaqueFunction(function=_amcl),
         # AMCL is a lifecycle node: it waits to be configured and activated. Default: our
         # lifecycle_activator, which re-reads the state and retries when a reply is lost. nav2's
         # lifecycle manager waited forever then (jobs 040/041: AMCL never activated, no fixes;
