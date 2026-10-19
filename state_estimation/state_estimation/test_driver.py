@@ -27,6 +27,12 @@ Pure pursuit (one control step, 50 Hz):
 Sequence: wait `start_delay` s (still -> ZUPT calibration), drive `laps` laps,
 stop and stay stopped (final ZUPTs). If the car stops moving while commanded
 to drive (collision), it stops and reports.
+wait_for_ok (2026-10-19, default true): also wait until /state_estimate reports mode OK (AMCL's
+first accepted fix), at most ok_timeout_s more -- like control, which must not race in INIT
+(contract: INIT -> no racing control). Before: a fixed 3 s; when AMCL's first pose came late (it
+varied from 2.9 s before to 0.2 s AFTER the start, any LiDAR model), the car left at full
+acceleration with an uninitialised AMCL -> 15-18 cm EKF errors on the first straight (jobs
+165 / 166 rst60, dsv60). No StateEstimate within the timeout -> drives anyway with a warning.
 Publishes /drive (ackermann_msgs/AckermannDriveStamped). Don't run teleop at
 the same time.
 """
@@ -118,6 +124,10 @@ try:
     from rclpy.node import Node
 except ImportError:
     Node = object
+try:
+    from apex_msgs.msg import StateEstimate
+except ImportError:                                  # without apex_msgs: no waiting for OK
+    StateEstimate = None
 
 
 def yaw_from_quat(q):
@@ -138,6 +148,8 @@ class TestDriver(Node):
         d('a_accel', 0.0)                   # m/s^2; physics profile only, 0 = no limit
         d('lookahead', 0.8)                 # m (+ 0.2 s * speed)
         d('start_delay', 3.0)               # s standing still before driving
+        d('wait_for_ok', True)              # ... and until /state_estimate says OK (docstring)
+        d('ok_timeout_s', 30.0)             # s more at most; then drive anyway (with a warning)
         d('wheelbase', 0.3302)
         d('max_steer', 0.4189)
         d('rate_hz', 50.0)
@@ -166,10 +178,14 @@ class TestDriver(Node):
         self.idx = None
         self.progress = 0.0                 # waypoints passed (unwrapped)
         self.t_start = None
+        self.t_go = None                    # when driving started (after start_delay [+ OK])
+        self.se_ok = False                  # /state_estimate reported mode OK at least once
         self.done = False
         self.stuck_since = None
 
         self.create_subscription(Odometry, '/ego_racecar/odom', self.odom_cb, 10)
+        if p('wait_for_ok') and StateEstimate is not None:
+            self.create_subscription(StateEstimate, '/state_estimate', self.se_cb, 10)
         self.pub = self.create_publisher(AckermannDriveStamped, '/drive', 10)
         self.create_timer(1.0 / p('rate_hz'), self.step)
         self.get_logger().info(
@@ -180,6 +196,10 @@ class TestDriver(Node):
         pp = msg.pose.pose
         self.pose = (pp.position.x, pp.position.y, yaw_from_quat(pp.orientation))
         self.speed = math.hypot(msg.twist.twist.linear.x, msg.twist.twist.linear.y)
+
+    def se_cb(self, msg):
+        if msg.mode == StateEstimate.MODE_OK:
+            self.se_ok = True
 
     def send(self, v, steer):
         m = AckermannDriveStamped()
@@ -205,6 +225,18 @@ class TestDriver(Node):
         if self.done or now - self.t_start < p('start_delay'):
             self.send(0.0, 0.0)
             return
+        if self.t_go is None:
+            want_ok = p('wait_for_ok') and StateEstimate is not None
+            waited = now - self.t_start
+            if want_ok and not self.se_ok and waited < p('start_delay') + p('ok_timeout_s'):
+                self.send(0.0, 0.0)                  # localization not OK yet: keep standing
+                return
+            self.t_go = now
+            if want_ok and self.se_ok:
+                self.get_logger().info(f'StateEstimate OK -> driving ({waited:.1f} s after the start)')
+            elif want_ok:
+                self.get_logger().warn(f'no StateEstimate OK within {p("ok_timeout_s"):.0f} s -> driving '
+                                       'anyway (check the localization)')
 
         x, y, yaw = self.pose
         v_cmd = float(self.v_ref[self.idx])
@@ -217,7 +249,7 @@ class TestDriver(Node):
         laps_done = self.progress / n
 
         # Collision / stuck detection
-        if self.speed < 0.05 and now - self.t_start > p('start_delay') + 2.0:
+        if self.speed < 0.05 and now - self.t_go > 2.0:
             self.stuck_since = self.stuck_since or now
             if now - self.stuck_since > 1.5:
                 self.get_logger().error('Car is not moving although commanded -- collision? Stopping.')
