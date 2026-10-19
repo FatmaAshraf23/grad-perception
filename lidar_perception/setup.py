@@ -26,6 +26,8 @@ setup(
             'scan_cluster_node = lidar_perception.scan_cluster_node:main',
             'cone_map_node = lidar_perception.cone_map_node:main',
             'obstacle_node = lidar_perception.obstacle_node:main',
+            'a1_emulator = lidar_perception.a1_emulator:main',
+            'scan_deskew = lidar_perception.scan_deskew:main',
         ],
     },
 )

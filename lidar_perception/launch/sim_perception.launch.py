@@ -1,9 +1,23 @@
-"""Start the simulator and the 7 Hz scan throttle (RPLIDAR A1 rate).
+"""Start the simulator and its RPLIDAR A1 model (/scan_a1, 7 Hz).
 
 Usage:  ros2 launch lidar_perception sim_perception.launch.py
         ros2 launch lidar_perception sim_perception.launch.py cones:=true
         ros2 launch lidar_perception sim_perception.launch.py config:=<sim yaml> car_map:=<map yaml>
+        ros2 launch lidar_perception sim_perception.launch.py lidar_model:=instant deskew:=false   (old LiDAR, A/B)
 (Drive with teleop_twist_keyboard in a separate terminal.)
+
+lidar_model / lidar_rate / deskew (2026-10-19, task 3b) -- how the A1 is simulated:
+  rotating (DEFAULT since 2026-10-19, together with deskew:=true = what the real car will run):
+          a1_emulator -- each beam from the moment it is measured during the turn, with the
+          rplidar_ros stamp and beam order (like the real sensor at speed: 0.86 m of motion per scan
+          at 6 m/s).
+  instant (the old way, for A/B): one INSTANTANEOUS simulator scan every 1/lidar_rate s (topic_tools
+          throttle) -- all beams from one pose, no motion distortion.
+  deskew:=true (default) puts scan_deskew between the LiDAR model (/scan_a1_raw) and /scan_a1, so everything
+          that reads /scan_a1 (sim_scan_relay -> AMCL, obstacle_node) gets de-skewed scans; it needs the
+          local EKF's odometry (/odom/ekf_local, from sim_localization) and passes scans through
+          unchanged until it arrives. deskew_mode: full | restamp | off; deskew_time_order: reverse
+          (rplidar_ros) | forward (LaserScan definition). With lidar_model:=instant it passes through.
 
 The track now uses walls instead of cones, so the cone nodes
 (scan_cluster_node, cone_map_node) are OFF by default. cones:=true starts them
@@ -68,14 +82,37 @@ def _simulator(context):
     ]
 
 
+def _lidar(context):
+    """The A1 model on /scan_a1: instantaneous (throttle) or rotating (a1_emulator), optionally de-skewed."""
+    arg = lambda n: LaunchConfiguration(n).perform(context).strip()   # noqa: E731
+    model = arg('lidar_model').lower()
+    rate = float(arg('lidar_rate'))
+    deskew = arg('deskew').lower() in ('1', 'true', 'yes', 'on')
+    out = '/scan_a1_raw' if deskew else '/scan_a1'
+    if model == 'instant':
+        # Simulator publishes /scan at 250 Hz; the RPLIDAR A1 gives ~7 Hz
+        nodes = [Node(package='topic_tools', executable='throttle', name='scan_throttle',
+                      arguments=['messages', '/scan', f'{rate}', out])]
+    elif model == 'rotating':
+        nodes = [Node(package='lidar_perception', executable='a1_emulator', name='a1_emulator', output='screen',
+                      parameters=[{'in_topic': '/scan', 'out_topic': out, 'rate_hz': rate}])]
+    else:
+        raise RuntimeError(f'lidar_model:={model} -- use instant or rotating')
+    if deskew:
+        nodes.append(Node(package='lidar_perception', executable='scan_deskew', name='scan_deskew', output='screen',
+                          parameters=[{'in_topic': '/scan_a1_raw', 'out_topic': '/scan_a1',
+                                       'odom_topic': '/odom/ekf_local', 'mode': arg('deskew_mode'),
+                                       'time_order': arg('deskew_time_order'),
+                                       'laser_x': 0.275, 'laser_y': 0.0, 'laser_yaw': 0.0}]))
+    chain = f'LiDAR model: {model} {rate:g} Hz'
+    if deskew:
+        chain += f' -> scan_deskew ({arg("deskew_mode")})'
+    nodes.append(LogInfo(msg=chain + ' -> /scan_a1'))
+    return nodes
+
+
 def generate_launch_description():
     cones = LaunchConfiguration('cones')
-
-    # Simulator publishes /scan at 250 Hz; the RPLIDAR A1 gives ~7 Hz
-    throttle = Node(
-        package='topic_tools', executable='throttle', name='scan_throttle',
-        arguments=['messages', '/scan', '7.0', '/scan_a1'],
-    )
 
     scan_cluster = Node(
         package='lidar_perception', executable='scan_cluster_node',
@@ -103,6 +140,13 @@ def generate_launch_description():
                               description="Map the car's software gets on /map ('' = the simulator's own map)"),
         DeclareLaunchArgument('sensor_frames', default_value='true',
                               description='static TFs of the sensors (apex_description) on ego_racecar/ and est/'),
+        # A1 model (2026-10-19, docstring): instant | rotating; turns per second; de-skew on / off
+        DeclareLaunchArgument('lidar_model', default_value='rotating'),
+        DeclareLaunchArgument('lidar_rate', default_value='7.0'),
+        DeclareLaunchArgument('deskew', default_value='true'),
+        DeclareLaunchArgument('deskew_mode', default_value='full'),
+        DeclareLaunchArgument('deskew_time_order', default_value='reverse'),
         OpaqueFunction(function=_simulator),
-        throttle, scan_cluster, cone_map, sensor_frames,
+        OpaqueFunction(function=_lidar),
+        scan_cluster, cone_map, sensor_frames,
     ])
