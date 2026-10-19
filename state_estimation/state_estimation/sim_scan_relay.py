@@ -14,6 +14,12 @@ This node
   3. republishes every scan from /scan_a1 on /scan_amcl with frame_id est/laser.
 The measurements themselves are untouched.
 
+TEST ONLY -- LiDAR dropout (2026-10-19, fault injection): while the parameter `drop`
+is true, no scan is relayed, so AMCL gets nothing = the LiDAR is gone. Switch it at
+runtime:  ros2 param set /sim_scan_relay drop true   (... false to end it).
+Used to prove the StateEstimate still goes DEGRADED (0.3 s) -> LOST (1.0 s of driving
+without a fix) on a real LiDAR loss. Default false (never set it in normal runs).
+
 On the real car this node is not needed: the LiDAR driver publishes the scan in
 'laser', and a static TF base_link -> laser comes from the car description.
 """
@@ -44,6 +50,9 @@ class SimScanRelay(Node):
         # Fallback if the TF lookup fails (sim.yaml: scan_distance_to_base_link)
         self.declare_parameter('laser_x', 0.275)
         self.declare_parameter('laser_y', 0.0)
+        self.declare_parameter('drop', False)       # TEST ONLY: LiDAR dropout while true (docstring)
+        self.dropping = False
+        self.dropped = 0
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -99,6 +108,17 @@ class SimScanRelay(Node):
                 self.destroy_subscription(self.tf_listener.tf_static_sub)
             self.tf_listener = None
             self.tf_buffer = None
+        drop = bool(self.get_parameter('drop').value)
+        if drop != self.dropping:                       # TEST ONLY: LiDAR dropout switched on / off
+            self.dropping = drop
+            if drop:
+                self.dropped = 0
+                self.get_logger().warn('TEST: LiDAR dropout ON -- scans are NOT relayed to AMCL')
+            else:
+                self.get_logger().warn(f'TEST: LiDAR dropout OFF after {self.dropped} dropped scans')
+        if drop:
+            self.dropped += 1
+            return
         msg.header.frame_id = self.get_parameter('est_laser_frame').value
         self.pub.publish(msg)
 

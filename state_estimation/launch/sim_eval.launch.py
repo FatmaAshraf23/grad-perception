@@ -29,6 +29,8 @@ slip_k (s^2/m; < 0 = from slip_file), slip_file. Default: slip with K from ~/.ro
 AMCL along-track slide (2026-10-19, passed to sim_localization): wheel_delay (s, the wheel speed's own
 delay for both EKFs' delay compensation; default 0.010 = the simulator; -1 = off) and amcl_thin_walls
 (default true: AMCL on its thin-wall copy of the map; false = the old /map).
+amcl_corridor_sigma (2026-10-19, passed to sim_localization -> ekf_global): AMCL poses wider than
+amcl_max_sigma are still used when their ellipse's narrow axis sigma <= this (default 0.10 m; 0 = off).
 Do NOT run teleop at the same time (both would send drive commands).
 """
 import os
@@ -60,7 +62,8 @@ def generate_launch_description():
                           'slip_k': LaunchConfiguration('slip_k'),
                           'slip_file': LaunchConfiguration('slip_file'),
                           'wheel_delay': LaunchConfiguration('wheel_delay'),
-                          'amcl_thin_walls': LaunchConfiguration('amcl_thin_walls')}.items(),
+                          'amcl_thin_walls': LaunchConfiguration('amcl_thin_walls'),
+                          'amcl_corridor_sigma': LaunchConfiguration('amcl_corridor_sigma')}.items(),
     )
     driver = Node(
         package='state_estimation', executable='test_driver', name='test_driver', output='screen',
@@ -101,6 +104,7 @@ def generate_launch_description():
         DeclareLaunchArgument('slip_file', default_value='~/.ros/vehicle_slip.yaml'),
         DeclareLaunchArgument('wheel_delay', default_value='0.010'),    # s, -1 = off (2026-10-19)
         DeclareLaunchArgument('amcl_thin_walls', default_value='true'), # AMCL on /map_amcl (2026-10-19)
+        DeclareLaunchArgument('amcl_corridor_sigma', default_value='0.10'),  # m, 0 = off (2026-10-19)
         # CPU rule (also for test_driver and eval_logger, which start here)
         SetEnvironmentVariable('OPENBLAS_NUM_THREADS', LaunchConfiguration('numpy_threads')),
         SetEnvironmentVariable('OMP_NUM_THREADS', LaunchConfiguration('numpy_threads')),

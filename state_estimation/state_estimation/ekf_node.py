@@ -132,7 +132,27 @@ UPDATE 2 -- AMCL pose (global EKF only)                       NEW in v3
     walls, 10-20 m off, and reported OK. Now:
       1. AMCL poses with sqrt(cov_xx + cov_yy) > amcl_max_sigma (0.35 m) are
          ignored -- AMCL itself says it is unsure (lost AMCL: > 0.2 m 99.9 % of
-         the time; normal laps: max 0.29 m).
+         the time; normal laps: max 0.29 m) -- UNLESS it is a CORRIDOR POSE
+         (2026-10-19, amcl_corridor_sigma, function amcl_pose_class): the
+         ellipse's NARROW axis sigma <= amcl_corridor_sigma (0.10 m). On a long
+         featureless straight the two walls fix the car's position ACROSS the
+         track (and its heading), not ALONG it: AMCL's particle cloud becomes a
+         long thin ellipse (closed1 at 6 m/s: along ~40 cm, across ~5.5 cm), and
+         the one-number size test threw away the good across-track part too.
+         Up to 1.6 s without an accepted fix -> StateEstimate DEGRADED / LOST
+         at 6 m/s while the EKF was right (sigma 3.8 cm, error p95 4.4 cm).
+         A corridor pose is used as a normal fix: R is AMCL's own covariance,
+         so the Kalman gain is ~0.1 across and ~0.002 along (it corrects e_y and
+         heading, hardly s); the NIS gate still applies; it NEVER counts towards
+         a jump (a jump replaces the whole pose, so AMCL must be sure in every
+         direction). Evidence: the 12 solid-map lost-AMCL sequences (4566 lost
+         poses): narrow sigma 12-150 cm (5th percentile); "<= 0.35 OR narrow
+         <= 0.10" lets through EXACTLY the same 76 lost poses as "<= 0.35"
+         alone (narrow <= 0.25 would add 885 -> 0.10 on purpose); normal laps:
+         narrow sigma max 8.1 cm. Offline replay of jobs 158/159 (6 m/s):
+         OK while driving 94.6 -> 100 % / 97.2 -> 99.7 %, accuracy unchanged.
+         amcl_corridor_sigma 0 = off (the old rule). REAL CAR: check the narrow
+         sigma of AMCL on a real recording (like amcl_max_sigma).
       2. After `reset_after_rejects` confident AMCL poses rejected in a row the
          EKF jumps only if BOTH checks pass, otherwise it keeps going on odometry
          (StateEstimate reports LOST after 1 s of driving without a fix):
@@ -314,13 +334,35 @@ class StateHistory:
 
 
 def amcl_measurement_noise(cov6x6, scale, min_sigma_pos, min_sigma_yaw):
-    """3x3 R (x, y, yaw) from AMCL's 6x6 covariance, inflated and floored."""
+    """3x3 R (x, y, yaw) from AMCL's 6x6 covariance, inflated and floored.
+    The position floor acts on the ellipse's AXES (eigenvalues of the x-y block), so "never trust
+    AMCL better than min_sigma_pos" holds in EVERY direction (2026-10-19; before: on the map's x / y
+    diagonal only, which a long thin corridor ellipse at an angle to the map axes slips through --
+    on the real car the map's axes are wherever SLAM started). Axis-aligned: identical to before."""
     c = np.asarray(cov6x6, dtype=float).reshape(6, 6)
     R = c[np.ix_([0, 1, 5], [0, 1, 5])] * scale
-    R[0, 0] = max(R[0, 0], min_sigma_pos ** 2)
-    R[1, 1] = max(R[1, 1], min_sigma_pos ** 2)
+    R = 0.5 * (R + R.T)
+    lam, V = np.linalg.eigh(R[:2, :2])
+    R[:2, :2] = (V * np.maximum(lam, min_sigma_pos ** 2)) @ V.T
     R[2, 2] = max(R[2, 2], min_sigma_yaw ** 2)
-    return 0.5 * (R + R.T)
+    return R
+
+
+def amcl_pose_class(cxx, cxy, cyy, max_sigma, corridor_sigma):
+    """How the global EKF treats an AMCL pose, from its x-y covariance (docstring RECOVERY 1):
+      'confident' sqrt(cxx + cyy) <= max_sigma: a normal fix; may count towards a jump
+      'corridor'  wider, but the ellipse's NARROW axis sigma <= corridor_sigma (> 0): AMCL is sure
+                  across a corridor, unsure along it -> a normal fix (its own covariance keeps the
+                  long axis out of the update), never a jump candidate
+      'unsure'    everything else: ignored"""
+    if math.sqrt(max(cxx + cyy, 0.0)) <= max_sigma:
+        return 'confident'
+    if corridor_sigma > 0.0:
+        half = 0.5 * (cxx + cyy)                          # smallest eigenvalue of [[cxx, cxy], [cxy, cyy]]
+        rad = math.sqrt(0.25 * (cxx - cyy) ** 2 + cxy ** 2)
+        if math.sqrt(max(half - rad, 0.0)) <= corridor_sigma:
+            return 'corridor'
+    return 'unsure'
 
 
 # ----------------------------------------------------------------------------
@@ -478,7 +520,9 @@ class EkfNode(Node):
         d('gate', CHI2_3DOF_99)
         d('reset_after_rejects', 10)        # confident AMCL poses rejected in a row before a jump is considered
         # Robust jump to AMCL (2026-10-06, docstring RECOVERY)
-        d('amcl_max_sigma', 0.35)           # m: AMCL poses with sqrt(cov_xx + cov_yy) above this are ignored
+        d('amcl_max_sigma', 0.35)           # m: AMCL poses with sqrt(cov_xx + cov_yy) above this are ignored ...
+        d('amcl_corridor_sigma', 0.10)      # m ... unless the ellipse's NARROW axis sigma <= this (a corridor
+                                            # pose: a fix, never a jump; 2026-10-19, docstring RECOVERY 1); 0 = off
         d('reset_tol_pos', 0.15)            # m   AMCL motion vs odometry over the rejected poses ...
         d('reset_tol_frac', 0.05)           #     ... + 5 % of the distance
         d('reset_tol_yaw_deg', 3.0)         # deg
@@ -615,8 +659,10 @@ class EkfNode(Node):
                 f"AMCL half-cell correction: +{100.0 * p('amcl_offset_m'):.2f} cm in x and y "
                 '(amcl_offset_m = map resolution / 2; 0 = off)')
             self.get_logger().info(
-                f"jump to AMCL only if it is clearly right: ignore AMCL sigma > {p('amcl_max_sigma'):.2f} m; "
-                f"after {p('reset_after_rejects')} rejected poses AMCL must move like the odometry"
+                f"jump to AMCL only if it is clearly right: ignore AMCL sigma > {p('amcl_max_sigma'):.2f} m"
+                + (f" unless a corridor pose (narrow axis sigma <= {p('amcl_corridor_sigma'):.2f} m: a fix, never a jump); "
+                   if p('amcl_corridor_sigma') > 0.0 else ' (corridor poses OFF); ')
+                + f"after {p('reset_after_rejects')} rejected poses AMCL must move like the odometry"
                 + (f" AND the scan ({p('scan_topic')}) must fit AMCL's pose >= {p('reset_scan_min'):.2f} and "
                    f"{p('reset_scan_margin'):.2f} better than the EKF's" if p('reset_scan_check') else
                    ' (scan check OFF)'))
@@ -760,13 +806,16 @@ class EkfNode(Node):
                                    math.radians(p('amcl_min_sigma_yaw_deg')))
         self.record_amcl_error(t_ns, z)
         cov = msg.pose.covariance
-        if math.sqrt(max(cov[0] + cov[7], 0.0)) > p('amcl_max_sigma'):
+        kind = amcl_pose_class(cov[0], cov[1], cov[7], p('amcl_max_sigma'), p('amcl_corridor_sigma'))
+        if kind == 'unsure':
             self.stats['unsure'] += 1               # AMCL itself is unsure (lost?) -> ignore this pose
             return
 
         nis = self.ekf.pose_nis(nu, R)
         if nis > p('gate'):
             self.stats['rej'] += 1
+            if kind != 'confident':
+                return                              # a corridor pose never counts towards a jump
             self.streak.append((t_ns, z.copy(), x_then[:3].copy()))
             if len(self.streak) >= p('reset_after_rejects'):
                 ok, why = self.jump_check(t_ns, z, x_then)
@@ -791,6 +840,8 @@ class EkfNode(Node):
         nis, dx = self.ekf.pose_update(nu, R)
         self.history.shift(dx)
         self.stats['acc'] += 1
+        if kind == 'corridor':
+            self.stats['corridor'] += 1
         self.stats['nis'] += nis
         nis_msg = Float64(data=nis)
         self.nis_pub.publish(nis_msg)
@@ -951,7 +1002,7 @@ class EkfNode(Node):
             amcl = (f"{sum(s['amcl_err']) / len(s['amcl_err']):4.2f} m"
                     if s['amcl_err'] else ' n/a')
             line += (f" | AMCL used {s['acc']:2d} rej {s['rej']:2d} unsure {s['unsure']:2d}"
-                     f' NIS {mean_nis:4.1f} AMCL err {amcl}')
+                     f" corridor {s['corridor']:2d} NIS {mean_nis:4.1f} AMCL err {amcl}")
             if s['refused'] or s['jumps']:
                 line += f" | jump refused {s['refused']} JUMPED {s['jumps']}"
             fit = self.scan_fit_now()
@@ -963,7 +1014,8 @@ class EkfNode(Node):
 
     @staticmethod
     def new_stats():
-        return {'acc': 0, 'rej': 0, 'nis': 0.0, 'amcl_err': [], 'unsure': 0, 'refused': 0, 'jumps': 0}
+        return {'acc': 0, 'rej': 0, 'nis': 0.0, 'amcl_err': [], 'unsure': 0, 'corridor': 0, 'refused': 0,
+                'jumps': 0}
 
     def scan_fit_now(self):
         """Health check every 2 s: how well does the latest scan fit the map at the EKF's

@@ -51,6 +51,10 @@ AMCL along-track slide (2026-10-19, see ekf_node / amcl_map.py / amcl_sim.yaml):
     adds it to AMCL's poses (ekf_node amcl_offset_m) and AMCL's START pose gets it subtracted, so AMCL
     starts exactly where the car is. (Its particles start with no spread; with the small alphas a
     2.5 cm start error took until the first corner to disappear.)
+amcl_corridor_sigma (2026-10-19, ekf_node docstring RECOVERY 1): ekf_global also uses AMCL poses
+  that are wider than amcl_max_sigma when their ellipse's NARROW axis sigma is <= this (a long
+  featureless straight: sure across, unsure along) -- a fix, never a jump. Default 0.10 m;
+  0 = off (the old rule; at 6 m/s ~1 s without fixes -> false DEGRADED / LOST).
 """
 import os
 import tempfile
@@ -104,6 +108,7 @@ def _ekfs_and_state_estimate(context):
     glob = dict(common, **{
         'mode': 'map', 'frame_id': 'map', 'child_frame_id': 'est/base_link',
         'publish_tf': False, 'use_amcl': yes('use_amcl'), 'amcl_offset_m': float(arg('amcl_offset')),
+        'amcl_corridor_sigma': float(arg('amcl_corridor_sigma')),
         'amcl_min_sigma_pos': float(arg('amcl_min_sigma_pos')),
         'x0': float(arg('x0')), 'y0': float(arg('y0')), 'yaw0': float(arg('yaw0')),
         'odom_topic': '/odom/ekf', 'path_topic': '/odom/ekf_path',
@@ -204,6 +209,8 @@ def generate_launch_description():
         DeclareLaunchArgument('wheel_delay', default_value='0.010'),
         DeclareLaunchArgument('amcl_thin_walls', default_value='true'),
         DeclareLaunchArgument('amcl_offset', default_value='0.025'),   # m, half the map cell (docstring)
+        # corridor poses (2026-10-19, docstring): narrow-axis sigma limit [m]; 0 = off (old rule)
+        DeclareLaunchArgument('amcl_corridor_sigma', default_value='0.10'),
 
         # CPU rule: limit numpy's math-library threads for every node below
         SetEnvironmentVariable('OPENBLAS_NUM_THREADS', LaunchConfiguration('numpy_threads')),
