@@ -131,6 +131,10 @@ class FakeImu(Node):
         self.declare_parameter('sim_step_s', 0.01)         # simulator physics step
         self.declare_parameter('stall_s', 0.025)           # no new state for longer = stalled
         self.declare_parameter('track_tau_s', 0.2)         # v3: correction time constant
+        # TEST ONLY (2026-10-20, fault scenarios for control): true = publish NOTHING (an IMU dropout);
+        # runtime: ros2 param set /fake_imu test_drop true|false
+        self.declare_parameter('test_drop', False)
+        self.test_drop_on, self.test_dropped = False, 0
 
         p = lambda n: self.get_parameter(n).value  # noqa: E731
         self.gyro_bias = RandomWalkBias(p('gyro_bias'), p('gyro_bias_walk'))
@@ -227,6 +231,15 @@ class FakeImu(Node):
         av = a_noise ** 2
         msg.linear_acceleration_covariance = [av, 0.0, 0.0, 0.0, av, 0.0, 0.0, 0.0, av]
 
+        drop = bool(p('test_drop'))
+        if drop != self.test_drop_on:                 # TEST ONLY: IMU dropout switched on / off
+            self.test_drop_on = drop
+            self.get_logger().warn('TEST: IMU dropout ON' if drop else
+                                   f'TEST: IMU dropout OFF after {self.test_dropped} dropped readings')
+            self.test_dropped = 0
+        if drop:
+            self.test_dropped += 1
+            return
         self.pub.publish(msg)
         self.bias_pub.publish(Float64(data=bias))
         ideal = Vector3Stamped()                    # what this reading was made from (evaluation)

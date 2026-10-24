@@ -48,6 +48,11 @@ class FakeVehicleSensors(Node):
         self.declare_parameter('sim_step_s', 0.01)
         self.declare_parameter('stall_s', 0.025)
         self.declare_parameter('track_tau_s', 0.2)
+        # TEST ONLY (2026-10-20, fault scenarios for control): the reported wheel speed is multiplied by this
+        # (> 1 = wheel spin, < 1 = wheels slipping / locking); runtime: ros2 param set /fake_vehicle_sensors
+        # test_speed_factor 1.15
+        self.declare_parameter('test_speed_factor', 1.0)
+        self.test_factor_on = 1.0
 
         p = lambda n: self.get_parameter(n).value  # noqa: E731
         self.true_speed = 0.0
@@ -102,7 +107,11 @@ class FakeVehicleSensors(Node):
         out.header.frame_id = 'ego_racecar/base_link'
         true_speed = (self.speed_model.sample(now.nanoseconds * 1e-9) if self.model == 'v3'
                       else self.true_speed)
-        speed = true_speed * (1.0 + p('speed_scale_error'))
+        f = float(p('test_speed_factor'))
+        if f != self.test_factor_on:                  # TEST ONLY: wheel slip switched on / off
+            self.test_factor_on = f
+            self.get_logger().warn(f'TEST: wheel speed x {f:.3f}')
+        speed = true_speed * (1.0 + p('speed_scale_error')) * f
         if abs(true_speed) > 1e-3:               # a stopped wheel reads zero
             speed += random.gauss(0.0, p('speed_noise'))
         out.drive.speed = speed
