@@ -66,7 +66,10 @@ def generate_launch_description():
                           'slip_file': LaunchConfiguration('slip_file'),
                           'wheel_delay': LaunchConfiguration('wheel_delay'),
                           'amcl_thin_walls': LaunchConfiguration('amcl_thin_walls'),
-                          'amcl_corridor_sigma': LaunchConfiguration('amcl_corridor_sigma')}.items(),
+                          'amcl_corridor_sigma': LaunchConfiguration('amcl_corridor_sigma'),
+                          'zupt_gate': LaunchConfiguration('zupt_gate'),
+                          'zupt_turn_max_s': LaunchConfiguration('zupt_turn_max_s'),
+                          'initialpose_topic': LaunchConfiguration('initialpose_topic')}.items(),
     )
     driver = Node(
         package='state_estimation', executable='test_driver', name='test_driver', output='screen',
@@ -76,6 +79,7 @@ def generate_launch_description():
                      'a_lat': ParameterValue(LaunchConfiguration('a_lat'), value_type=float),
                      'a_brake': ParameterValue(LaunchConfiguration('a_brake'), value_type=float),
                      'a_accel': ParameterValue(LaunchConfiguration('a_accel'), value_type=float),
+                     'start_delay': ParameterValue(LaunchConfiguration('start_delay'), value_type=float),
                      'waypoints': ParameterValue(LaunchConfiguration('waypoints'), value_type=str)}],
     )
     logger = Node(
@@ -109,6 +113,10 @@ def generate_launch_description():
         DeclareLaunchArgument('wheel_delay', default_value='0.010'),    # s, -1 = off (2026-10-19)
         DeclareLaunchArgument('amcl_thin_walls', default_value='true'), # AMCL on /map_amcl (2026-10-19)
         DeclareLaunchArgument('amcl_corridor_sigma', default_value='0.10'),  # m, 0 = off (2026-10-19)
+        DeclareLaunchArgument('zupt_gate', default_value='16.0'),          # standstill gate, 0 = old rule (2026-10-24)
+        DeclareLaunchArgument('zupt_turn_max_s', default_value='3.0'),     # longer standstill "turn" = bias change
+        DeclareLaunchArgument('initialpose_topic', default_value='/initialpose'),  # tests: /initialpose_est
+        DeclareLaunchArgument('start_delay', default_value='3.0'),         # s parked before the test driver drives
         # CPU rule (also for test_driver and eval_logger, which start here)
         SetEnvironmentVariable('OPENBLAS_NUM_THREADS', LaunchConfiguration('numpy_threads')),
         SetEnvironmentVariable('OMP_NUM_THREADS', LaunchConfiguration('numpy_threads')),

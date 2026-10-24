@@ -95,8 +95,10 @@ def _ekfs_and_state_estimate(context):
     slip = {'beta_model': arg('beta_model'), 'slip_k': float(arg('slip_k')), 'slip_file': arg('slip_file')}
     common = dict(slip, **{'path_period_s': float(arg('ekf_path_period')), 'scale_file': arg('scale_file'),
                            'steer_calib_file': arg('steer_calib_file'),
-                           'wheel_delay_s': float(arg('wheel_delay'))})
-    se = dict(slip, **{'steer_calib_file': arg('steer_calib_file'), 'track': arg('track')})
+                           'wheel_delay_s': float(arg('wheel_delay')), 'zupt_gate': float(arg('zupt_gate')),
+                           'zupt_turn_max_s': float(arg('zupt_turn_max_s'))})
+    se = dict(slip, **{'steer_calib_file': arg('steer_calib_file'), 'track': arg('track'),
+                       'initialpose_topic': arg('initialpose_topic')})
     # LOCAL EKF: odometry for AMCL, starts at the origin of the odom frame
     local = dict(common, **{
         'mode': 'odom', 'frame_id': 'odom', 'child_frame_id': 'est/base_link',
@@ -113,7 +115,8 @@ def _ekfs_and_state_estimate(context):
         'x0': float(arg('x0')), 'y0': float(arg('y0')), 'yaw0': float(arg('yaw0')),
         'odom_topic': '/odom/ekf', 'path_topic': '/odom/ekf_path',
         'diag_prefix': '/ekf', 'truth_topic': arg('ekf_truth_topic'),
-        'test_fault': arg('ekf_test_fault'), 'allow_test_faults': yes('allow_test_faults')})
+        'test_fault': arg('ekf_test_fault'), 'allow_test_faults': yes('allow_test_faults'),
+        'initialpose_topic': arg('initialpose_topic')})
     with_se = yes('state_estimate')
     pipeline = arg('pipeline').lower()
 
@@ -145,6 +148,7 @@ def _amcl(context):
     thin = arg('amcl_thin_walls').lower() in ('1', 'true', 'yes', 'on')
     off = float(arg('amcl_offset'))                 # AMCL's frame = the true map shifted by half a cell
     amcl_yaml = os.path.join(get_package_share_directory('state_estimation'), 'config', 'amcl_sim.yaml')
+    ipt = arg('initialpose_topic')                  # AMCL listens there too (default /initialpose)
     actions = []
     if thin:
         actions.append(Node(package='state_estimation', executable='amcl_map_filter', name='amcl_map_filter',
@@ -155,7 +159,8 @@ def _amcl(context):
                                                 'initial_pose.y': float(arg('y0')) - off,
                                                 'initial_pose.yaw': float(arg('yaw0')),
                                                 'map_topic': '/map_amcl' if thin else '/map'}],
-                        remappings=[('/map', '/map_amcl')] if thin else []))
+                        remappings=([('/map', '/map_amcl')] if thin else [])
+                        + ([('/initialpose', ipt)] if ipt != '/initialpose' else [])))
     return actions
 
 
@@ -215,6 +220,14 @@ def generate_launch_description():
         DeclareLaunchArgument('amcl_offset', default_value='0.025'),   # m, half the map cell (docstring)
         # corridor poses (2026-10-19, docstring): narrow-axis sigma limit [m]; 0 = off (old rule)
         DeclareLaunchArgument('amcl_corridor_sigma', default_value='0.10'),
+        # standstill gate (2026-10-24, ekf_node docstring UPDATE 1): NIS above this = the parked car is being
+        # turned -> heading follows the gyro, bias kept; 0 = old rule
+        DeclareLaunchArgument('zupt_gate', default_value='16.0'),
+        DeclareLaunchArgument('zupt_turn_max_s', default_value='3.0'),  # longer standstill "turn" = bias change; 0 = off
+        # where the estimator (both EKFs' resets, AMCL, state_estimate) takes a start pose from. The simulator
+        # always listens on /initialpose and MOVES THE CAR -> tests use /initialpose_est here, so a pose on
+        # /initialpose moves only the simulated car (= turned / moved by hand) (2026-10-24)
+        DeclareLaunchArgument('initialpose_topic', default_value='/initialpose'),
 
         # CPU rule: limit numpy's math-library threads for every node below
         SetEnvironmentVariable('OPENBLAS_NUM_THREADS', LaunchConfiguration('numpy_threads')),

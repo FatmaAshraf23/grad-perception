@@ -33,7 +33,27 @@ PREDICT (100 Hz, every IMU message) -- unchanged from v2
     px += v cos(yaw+beta) dt,  py += v sin(yaw+beta) dt,  yaw += w dt
     P  = F P F^T + G Qu G^T + Q_b + Q_k
 
-UPDATE 1 -- ZUPT while stopped (both modes) -- unchanged
+UPDATE 1 -- ZUPT while stopped (both modes)
+    While the wheels stand still the true turn rate should be 0, so the gyro reading is bias + noise:
+    z = w_meas, h(x) = b, R = sigma_w^2 -> the gyro bias is learned (zero-velocity update).
+    STANDSTILL GATE (2026-10-24, parameter zupt_gate, LocalizationEKF.standstill): a reading far from
+    the bias we know,  NIS = (w_meas - b)^2 / (P_bb + sigma_w^2) > zupt_gate  (16 = 4 sigma),
+    means the car IS turning while its wheels stand still (lifted and turned by hand on the start
+    line). Then: no bias update, and the heading follows the gyro (a normal prediction with v = 0).
+    Why (job 195, F10 parked): a 15 deg turn of the parked car was learned as bias, +9.6 deg/s
+    instead of +0.6, and after the start the heading drifted 6-9 deg/s: lost for the whole run.
+    The gate widens by itself while the bias is still uncertain (P_bb large at start-up), so an
+    unknown start bias is still learned. zupt_gate 0 = the old rule (always ZUPT).
+    REAL CAR: sigma_w from the IMU bench test (imu_static_check) -- a too small sigma_w makes the gate
+    reject ordinary noise; sigma_bias0 must cover the bias left after the IMU driver's start-up
+    calibration. Known limit: a turn slower than ~4 sigma_w (~1 deg/s in the sim) is still absorbed
+    into the bias; the map check flags the heading error that follows.
+    LONG "TURN" = BIAS CHANGE (parameter zupt_turn_max_s, StandstillTurns): a hand turn takes a second
+    or two, but a gyro bias that CHANGED while driving (warm-up; the local EKF has no AMCL to track it)
+    looks like a turn that never ends. A standstill "turn" longer than zupt_turn_max_s (3 s) is taken as
+    a bias change: the heading change it made is undone, P_bb is opened again (at least sigma_bias0^2
+    and the episode's mean rate^2, so the next reading passes the gate) and the bias is learned again.
+    Price: a single continuous hand turn longer than 3 s is undone too (turn the car in short moves).
 
 UPDATE 2 -- AMCL pose (global EKF only)                       NEW in v3
     z = [x, y, yaw] from /amcl_pose,   h(x) = [px, py, yaw],
@@ -323,6 +343,21 @@ class LocalizationEKF:
         R = np.array([[self.sigma_w ** 2]])
         self._update(nu, H, R)
 
+    def standstill(self, w_meas, dt, gate):
+        """One IMU step with the wheels standing still (2026-10-24, docstring UPDATE 1).
+        Normally the true turn rate is 0, so the reading is bias + noise -> ZUPT learns b.
+        NIS = (w_meas - b)^2 / (P_bb + sigma_w^2) > gate -> the car is being turned: no bias
+        update, the heading follows the gyro (prediction with v = 0). gate <= 0: always ZUPT.
+        Returns (turning, nis)."""
+        nu = float(w_meas - self.x[self.B])
+        nis = nu * nu / (float(self.P[self.B, self.B]) + self.sigma_w ** 2)
+        if gate > 0.0 and nis > gate:
+            self.predict(0.0, w_meas, 0.0, dt)
+            return True, nis
+        self.stationary_predict(dt)
+        self.zupt(w_meas)
+        return False, nis
+
     # --- update 2: pose (from AMCL) ------------------------------------------
 
     H_POSE = np.hstack([np.eye(3), np.zeros((3, 2))])
@@ -350,6 +385,63 @@ class LocalizationEKF:
 
     def sigma_pos(self):
         return math.sqrt(max(self.P[0, 0] + self.P[1, 1], 0.0))
+
+
+class StandstillTurns:
+    """The standstill gate's bookkeeping (docstring UPDATE 1), no ROS -> testable offline.
+    step(ekf, w_meas, dt): one gyro sample with the wheels standing still; moving(): the car set off.
+    Both return an event for the log, or None:
+      ('start', rate_deg_s, nis)                a turn while standing began
+      ('end', deg, why)                         it ended (standing still again / the car set off)
+      ('bias_change', deg, secs, bias_deg_s)    it went on longer than max_turn_s -> it was the gyro bias
+                                                changing, not a hand turn: heading change undone, bias re-learned
+    """
+
+    def __init__(self, gate=16.0, max_turn_s=3.0, still_after=20, sigma_bias0=0.05):
+        self.gate, self.max_turn_s = float(gate), float(max_turn_s)
+        self.still_after, self.sigma_bias0 = int(still_after), float(sigma_bias0)
+        self.zupts = 0                      # samples used to learn the bias
+        self.turn_samples = 0               # samples taken as a turn
+        self.bias_changes = 0               # "turns" that were really a bias change (max_turn_s)
+        self.deg = None                     # degrees turned in the episode going on (None = no episode)
+        self.secs = 0.0                     # how long the episode has been going on
+        self.calm = 0                       # bias-learning samples in a row since the last turn sample
+
+    def step(self, ekf, w_meas, dt):
+        turning, nis = ekf.standstill(w_meas, dt, self.gate)
+        ev = None
+        if turning:
+            self.turn_samples += 1
+            self.calm = 0
+            rate = w_meas - float(ekf.x[ekf.B])           # what predict() just turned the heading by, per s
+            if self.deg is None:
+                self.deg, self.secs = 0.0, 0.0
+                ev = ('start', math.degrees(rate), nis)
+            self.deg += math.degrees(rate * dt)
+        else:
+            self.zupts += 1
+            self.calm += 1
+        if self.deg is None:
+            return ev
+        self.secs += dt
+        if not turning and self.calm >= self.still_after:
+            return self._end('standing still again')
+        if self.max_turn_s > 0.0 and self.secs > self.max_turn_s:
+            mean_rate = math.radians(self.deg) / self.secs
+            ekf.x[ekf.YAW] = wrap(float(ekf.x[ekf.YAW]) - math.radians(self.deg))
+            ekf.P[ekf.B, ekf.B] = max(float(ekf.P[ekf.B, ekf.B]), self.sigma_bias0 ** 2, mean_rate ** 2)
+            self.bias_changes += 1
+            ev = ('bias_change', self.deg, self.secs, math.degrees(float(ekf.x[ekf.B])))
+            self.deg = None
+        return ev
+
+    def moving(self):
+        return self._end('the car set off') if self.deg is not None else None
+
+    def _end(self, why):
+        ev = ('end', self.deg, why)
+        self.deg = None
+        return ev
 
 
 class StateHistory:
@@ -636,6 +728,11 @@ class EkfNode(Node):
         # Zero-velocity detection
         d('stopped_speed', 0.01)
         d('stopped_time', 0.3)
+        d('zupt_gate', 16.0)                # standstill: NIS of gyro vs bias above this = turned by hand (docstring
+                                            # UPDATE 1); 0 = old rule (always learn the bias)
+        d('zupt_turn_max_s', 3.0)           # a standstill "turn" longer than this = the gyro bias changed (docstring
+                                            # UPDATE 1); 0 = no limit
+        d('initialpose_topic', '/initialpose')  # global EKF: where a start pose comes from (sim tests: /initialpose_est)
         # Steering calibration (steer_calib); 'none' = use the measured steering as it is
         d('steer_calib_file', '~/.ros/steering_calibration.yaml')
         # Speed-scale calibration file (see docstring)
@@ -682,7 +779,8 @@ class EkfNode(Node):
         self.steer = 0.0
         self.stopped_since = None
         self.last_imu_t = None
-        self.zupt_count = 0
+        self.still = StandstillTurns(gate=p('zupt_gate'), max_turn_s=p('zupt_turn_max_s'),
+                                     sigma_bias0=p('sigma_bias0'))      # standstill gate (docstring UPDATE 1)
         self.distance = 0.0
         self.truth = None
         self.truth_hist = deque(maxlen=400)
@@ -729,7 +827,7 @@ class EkfNode(Node):
             self.create_subscription(AckermannDriveStamped, '/vehicle/measured', self.meas_cb, 50)
         if self.global_mode:
             self.create_subscription(PoseWithCovarianceStamped, p('amcl_topic'), self.amcl_cb, 10)
-            self.create_subscription(PoseWithCovarianceStamped, '/initialpose', self.reset_cb, 10)
+            self.create_subscription(PoseWithCovarianceStamped, p('initialpose_topic'), self.reset_cb, 10)
             if p('use_amcl') and str(p('map_topic')).strip():
                 # map_server publishes the map once, "latched" (transient local) -> late joiners get it
                 self.create_subscription(OccupancyGrid, p('map_topic'), self.map_cb, QoSProfile(
@@ -894,11 +992,10 @@ class EkfNode(Node):
             dv = self.wheel_comp.on_imu(t.nanoseconds * 1e-9, self.imu_c * a.x - self.imu_s * a.y, dt, stopped)
             self.v_used = self.v + dv / max(float(self.ekf.x[4]), 0.5)      # raw units, as v
 
-        if stopped:
-            self.ekf.stationary_predict(dt)
-            self.ekf.zupt(w_m)
-            self.zupt_count += 1
+        if stopped:                         # ZUPT, or a turn while standing (docstring UPDATE 1)
+            self.log_standstill(self.still.step(self.ekf, w_m, dt))
         else:
+            self.log_standstill(self.still.moving())
             # sideslip (vehicle_model): 'steer' = kinematic from the steering, 'slip' = gyro + tyre slip
             beta = self.sideslip.beta(self.ekf.x[4] * self.v_used, w_m - self.ekf.x[3], self.steer)
             self.ekf.predict(self.v_used, w_m, beta, dt)
@@ -917,6 +1014,22 @@ class EkfNode(Node):
                 self.fault = None
         self.history.add(t.nanoseconds, self.ekf.x)
         self.publish_odom(msg.header.stamp, w_m)
+
+    def log_standstill(self, ev):
+        """One log line per standstill event (StandstillTurns, docstring UPDATE 1)."""
+        if ev is None:
+            return
+        lg = self.get_logger()
+        b = math.degrees(float(self.ekf.x[self.ekf.B]))
+        if ev[0] == 'start':
+            lg.warn(f'TURNED WHILE STANDING: the gyro reads {ev[1]:+.1f} deg/s with the wheels still (NIS {ev[2]:.0f} > '
+                    f'{self.still.gate:g}) -> the heading follows the gyro, the bias is not updated')
+        elif ev[0] == 'end':
+            lg.info(f'{ev[2]}: turned {ev[1]:+.1f} deg while the wheels stood still (gyro bias kept at {b:+.2f} deg/s)')
+        else:
+            lg.warn(f'STANDSTILL "TURN" LASTED {ev[2]:.1f} s (> zupt_turn_max_s {self.still.max_turn_s:g}): taken as a '
+                    f'GYRO-BIAS CHANGE, not a hand turn -> its heading change of {ev[1]:+.1f} deg undone, the bias '
+                    f'({ev[3]:+.2f} deg/s) is learned again')
 
     def amcl_cb(self, msg):
         p = lambda n: self.get_parameter(n).value  # noqa: E731
@@ -985,7 +1098,8 @@ class EkfNode(Node):
         self.history.buf.clear()
         self.distance = 0.0
         self.path.poses.clear()
-        self.get_logger().info('EKF pose reset from /initialpose (bias and speed scale kept)')
+        self.get_logger().info(f"EKF pose reset from {self.get_parameter('initialpose_topic').value} "
+                               '(bias and speed scale kept)')
 
     def jump_check(self, t_ns, z, x_then):
         """-> (ok, reason): may the EKF jump to AMCL? (docstring RECOVERY)"""
@@ -1232,7 +1346,9 @@ class EkfNode(Node):
                          f"{mc['last']:+.2f} m, {np.mean(mc['ms']):.2f} ms (max {max(mc['ms']):.2f}), "
                          f"every {self.mc_budget.every_n}")
             self.mc_stats = self.new_mc_stats()
-        line += f' | ZUPTs {self.zupt_count}'
+        st = self.still
+        line += f' | ZUPTs {st.zupts}' + (f' | turned while standing: {st.turn_samples} samples' if st.turn_samples
+                                          else '') + (f', bias changes {st.bias_changes}' if st.bias_changes else '')
         self.stats = self.new_stats()
         self.get_logger().info(line)
 

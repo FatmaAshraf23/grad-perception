@@ -143,6 +143,7 @@ class StateEstimateNode(Node):
         d('std_vy_rel', 0.05); d('std_vy_min', 0.02)
         d('std_r', 0.01)
         d('stats_every_s', 5.0)
+        d('initialpose_topic', '/initialpose')  # a start pose = FLAG_FILTER_RESET (sim tests: /initialpose_est)
         # steering calibration (steer_calib) for beta -> vx, vy; 'none' = measured steering as it is
         d('steer_calib_file', '~/.ros/steering_calibration.yaml')
         p = lambda n: self.get_parameter(n).value  # noqa: E731
@@ -185,7 +186,7 @@ class StateEstimateNode(Node):
             self.create_subscription(Imu, '/imu/data', self.imu_cb, 100)
             self.create_subscription(Float64, '/ekf/nis', self.fix_cb, 10)
             self.create_subscription(Float64MultiArray, p('map_check_topic'), self.map_check_cb, 10)
-        self.create_subscription(PoseWithCovarianceStamped, '/initialpose', self.reset_cb, 10)
+        self.create_subscription(PoseWithCovarianceStamped, p('initialpose_topic'), self.reset_cb, 10)
         self.create_timer(p('stats_every_s'), self.report)
 
     def now_s(self):
