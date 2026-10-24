@@ -1,5 +1,6 @@
 # APEX StateEstimate -- schema "apex-state-estimate/1.0"
-# Perception -> Control state contract v0.2, section 2. SI units, map (track) frame,
+# Perception -> Control state contract v0.3 (= v0.2 + FLAG_MAP_MISMATCH, FLAG_ESTIMATOR_LAG,
+# valid_for_ms 50 ms; schema 1.1), section 2. SI units, map (track) frame,
 # all values refer to the vehicle CG. NaN / Inf are never sent.
 #
 # header.stamp = time at which the state is VALID (newest IMU sample fused), same
@@ -8,7 +9,7 @@
 
 std_msgs/Header header
 
-string schema_version          # "apex-state-estimate/1.0"; reject unknown major versions
+string schema_version          # "apex-state-estimate/1.1" (v0.3); reject unknown MAJOR versions
 uint32 sequence_id             # +1 per message; gaps reveal drops
 uint64 stamp_us                # time the state is valid [us] (same clock as header.stamp)
 uint64 publish_us              # send time [us]; publish_us - stamp_us = estimator latency
@@ -62,6 +63,8 @@ uint16 FLAG_OFF_TRACK = 64           # bit 6: |e_y| > half the local track width
 uint16 FLAG_FILTER_RESET = 128       # bit 7: estimator re-initialized since the last message
 uint16 FLAG_PROJECTION_RESEEDED = 256  # bit 8: Frenet projection used a global search
 uint16 FLAG_NEAR_SINGULAR = 512      # bit 9: 1 - kappa * e_y < 0.3
+uint16 FLAG_MAP_MISMATCH = 1024      # bit 10 (v0.3): the LiDAR scan says the pose is wrong (map check, hysteresis) -> DEGRADED
+uint16 FLAG_ESTIMATOR_LAG = 2048     # bit 11 (v0.3): published > 25 ms after the stamp, 2 in a row (off: < 10 ms for 1 s) -> DEGRADED
 uint16 flags
 
-uint16 valid_for_ms            # control may use this state until stamp + valid_for_ms (30 ms, provisional)
+uint16 valid_for_ms            # control may use this state until stamp + valid_for_ms (50 ms since v0.3, provisional)
