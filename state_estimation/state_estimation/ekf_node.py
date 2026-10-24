@@ -175,6 +175,45 @@ UPDATE 2 -- AMCL pose (global EKF only)                       NEW in v3
     test_fault (TEST ONLY, default off): 't_s,dx,dy,dyaw_deg' moves ekf_global's
     pose once, t_s seconds after its first IMU message -- a "kidnapped" EKF while
     AMCL is fine, to test the jump live.
+    test_kick (TEST ONLY, 2026-10-20, default off): the same at RUNTIME --
+    `ros2 param set /ekf_global test_kick 'dx,dy,dyaw_deg'` moves the pose at the next IMU
+    message (fault scenarios for control, task 3(c)); setting it again with a new value kicks again.
+    LOCKED (2026-10-24): both work only when allow_test_faults is true -- a READ-ONLY parameter set
+    once at start-up, by the SIMULATOR launch files (sim_localization / sim_eval: default true there).
+    Node default false = the real car: test_kick is then not even declared (`ros2 param set` is
+    refused) and a test_fault value is ignored with an error in the log. state_pipeline's
+    test_lag_ms follows ekf_global's switch. Never set allow_test_faults in the real car's launch.
+
+MAP CHECK -- along-track position vs the LiDAR (global EKF only, 2026-10-21)  NEW
+    Why: on a straight AMCL only knows the ACROSS-track position (corridor fixes), so an
+    along-track error (wheel over-read / spin, a pose kick) stayed invisible until the next
+    corner -- fault scenarios F05 / F06 / F08: mode OK for 1.0-2.3 s with 0.5-0.9 m error.
+    What: for every scan, slide the EKF pose along its heading (+-map_check_max_shift in
+    map_check_step) and find where the scan fits the map best (map_check.py: distance field
+    built once from the map -> one table lookup per beam and shift, ~0.1 ms per scan on the
+    laptop, est. 0.3-0.5 ms on a Pi 5). Alarm when map_check_k scans in a row say the pose is
+    map_check_shift_min .. (max_shift - step) off with a clear (gain >= map_check_gain_min),
+    sharp (width <= map_check_width_max) optimum.
+    Offline (jobs 178-181, 22 recorded runs): measures the along error to ~5.5 cm (median),
+    0 false alarms on 5603 clean scans, F08 detected after 0.19 s (mode today: 2.4 s), F05 0.59 s
+    (2.3 s), F06 0.88 s (1.5 s).
+    ALARM WITH HYSTERESIS (contract v0.3, 2026-10-24; map_check.MismatchAlarm). Every checked scan is
+      BAD    the along rule above, OR fit0 < map_check_fit_bad: the scan hardly fits the map at the EKF
+             pose at all (sideways / heading errors, poses beyond the search window -- F04, F09, F10),
+      CLEAN  no shift fits more than map_check_gain_clear better AND fit0 >= map_check_fit_clear,
+      or neither (keeps the state). ON after map_check_k BAD scans in a row; OFF after
+    map_check_k_clear CLEAN scans in a row and >= map_check_min_on_s on. The alarm goes to state_estimate
+    (map_check_hooks in state_pipeline, or the topic) -> FLAG_MAP_MISMATCH (1024) + mode at least
+    DEGRADED. The EKF itself does not use it (its state and covariance are unchanged).
+    Offline with the same class (2026-10-24; 12 clean + 10 fault runs): 0 false alarms, 0 premature
+    clears; time with the EKF > 30 cm off while the mode said OK 10.3 s -> 1.6 s over the 10 faults.
+    The distance field is built in a BACKGROUND THREAD: numpy without scipy needs 0.1-0.23 s on the
+    laptop, and inside the map callback that stalled the whole estimator (jobs 182-183: a 0.13-0.19 s
+    lag spike at start-up; a Pi would take longer; a re-published map would do it mid-race).
+    CPU guard (map_check_budget_ms): every run is timed; if the mean cost exceeds the budget the
+    check runs only on every n-th scan (n <= map_check_max_every) instead of slowing the EKF.
+    REAL CAR: the thresholds come from the simulator, where the LiDAR sees exactly the map;
+    refit on real recordings (people near the walls, an imperfect map lower the fit).
 
 Topics
   in : /imu/data (gyro z; + accel x/y with wheel_delay_s >= 0), /vehicle/measured,
@@ -185,6 +224,10 @@ Topics
                       default 'none' = off -- the real car has no truth)
   out: <odom_topic>, <path_topic> (only if path_period_s > 0; for viewing),
        <diag_prefix>/bias, /bias_sigma, /speed_scale, /nis ;
+       <diag_prefix>/map_check (global; std_msgs/Float64MultiArray, one per checked scan:
+           [scan stamp s, shift m, gain, width m, fit0, beams, alarm 0/1, cost ms, every_n,
+            state age ms, scan class (-1 no result, 0 neither, 1 clean, 2 bad along, 3 bad fit,
+            4 both; v0.3)]; shift > 0 = the EKF is BEHIND, nan = too few returns) ;
        TF odom -> est/base_link (local only)
 
 CPU (2026-10-03): in Python ROS 2 the cost is mostly MESSAGES, not math. The sim
@@ -196,6 +239,7 @@ to state_estimate without a message.
 """
 import math
 import os
+import threading
 import time
 from collections import deque
 
@@ -325,6 +369,21 @@ class StateHistory:
         if not self.buf or t_ns < self.buf[0][0] - 20_000_000:
             return None
         return min(self.buf, key=lambda e: abs(e[0] - t_ns))[1]
+
+    def nearest(self, t_ns):
+        """(t_ns, state) closest in time to t_ns, or None (same rule as at()). Searches from the
+        newest entry backwards and stops once it moves away -- a scan is always recent, so this
+        is a few steps instead of the whole buffer (per-scan cost on the Pi)."""
+        if not self.buf or t_ns < self.buf[0][0] - 20_000_000:
+            return None
+        best = None
+        for t, x in reversed(self.buf):
+            dt = abs(t - t_ns)
+            if best is None or dt < best[0]:
+                best = (dt, t, x)
+            elif t < t_ns:
+                break
+        return best[1], best[2]
 
     def shift(self, dx):
         """Apply a correction to the stored past too (it was wrong by the same amount)."""
@@ -462,10 +521,12 @@ try:
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
     from rclpy.time import Time
     from sensor_msgs.msg import Imu, LaserScan
-    from std_msgs.msg import Float64
+    from std_msgs.msg import Float64, Float64MultiArray
     from tf2_ros import TransformBroadcaster
 
     from state_estimation.calibration import load_steering
+    from state_estimation.map_check import (BAD_ALONG, BAD_FIT, CpuBudget, DistanceField, MismatchAlarm, make_shifts,
+                                            shift_search)
     from state_estimation.vehicle_model import sideslip_from_params
     from state_estimation.wheel_delay import WheelSpeedCompensator
 except ImportError:
@@ -535,7 +596,33 @@ class EkfNode(Node):
         d('laser_x', 0.275)                 # m   where the LiDAR sits on the car (base_link -> laser;
         d('laser_y', 0.0)                   # m   sim: scan_distance_to_base_link)
         d('laser_yaw', 0.0)                 # rad
+        # Map check: along-track position vs the LiDAR (2026-10-21, docstring MAP CHECK; its alarm ->
+        # state_estimate FLAG_MAP_MISMATCH + DEGRADED since contract v0.3, 2026-10-24)
+        d('map_check', True)                # global EKF: run it on every scan (needs map_topic + scan_topic)
+        d('map_check_beams', 180)           # beams per scan (evenly spread)
+        d('map_check_max_shift', 1.0)       # m: search +- this along the heading ...
+        d('map_check_step', 0.05)           # m  ... in these steps (41 shifts)
+        d('map_check_tol', 0.10)            # m: a beam fits if its end point lies this close to a wall
+        d('map_check_shift_min', 0.30)      # m: alarm only for errors at least this big ...
+        d('map_check_gain_min', 0.05)       #    ... if the best shift fits >= 5 points better than 0 ...
+        d('map_check_width_max', 0.30)      # m  ... is one sharp optimum (not a flat corridor) ...
+        d('map_check_k', 2)                 #    ... in this many checked scans in a row
+        d('map_check_budget_ms', 2.0)       # ms per scan on average; above -> check only every n-th scan
+        d('map_check_max_every', 7)         #    n <= this (7 = once per second at 7 Hz)
+        d('map_check_fit_bad', 0.5)         # BAD also when the scan fits the map worse than this at the EKF pose
+        d('map_check_gain_clear', 0.02)     # CLEAN: no shift fits more than this better than the pose ...
+        d('map_check_fit_clear', 0.90)      #        ... and the scan fits at least this well at the pose
+        d('map_check_k_clear', 4)           # alarm OFF after this many CLEAN scans in a row ...
+        d('map_check_min_on_s', 0.5)        #           ... and at least this long on (s, scan time)
+        # TEST ONLY switches (simulator fault scenarios) work only with allow_test_faults true: read-only, set
+        # at start-up by the SIMULATOR launch files; false (the default) on the real car (2026-10-24, docstring)
+        from rcl_interfaces.msg import ParameterDescriptor
+        d('allow_test_faults', False, ParameterDescriptor(
+            read_only=True, description='simulator only: unlock test_fault / test_kick / test_lag_ms'))
+        self.allow_test_faults = bool(self.get_parameter('allow_test_faults').value)
         d('test_fault', '')                 # TEST ONLY: 't_s,dx,dy,dyaw_deg' moves ekf_global's pose once
+        if self.allow_test_faults:
+            d('test_kick', '')              # TEST ONLY, runtime: 'dx,dy,dyaw_deg' moves the pose at the next IMU
         d('history_s', 2.0)
         # Vehicle geometry for the slip angle
         d('lf', 0.15875); d('lr', 0.17145)
@@ -604,12 +691,24 @@ class EkfNode(Node):
         self.imu_count = 0
         self.map_checked = False
         self.wall_map = None                # walls of the map, for the scan check
+        self.dfield = None                  # distance field of the same map, for the map check
+        self.map_check_on = bool(self.global_mode and p('use_amcl') and p('map_check'))
+        self.mc_shifts = make_shifts(p('map_check_max_shift'), p('map_check_step'))
+        self.mc_monitor = MismatchAlarm(
+            p('map_check_shift_min'), p('map_check_max_shift') - p('map_check_step') + 1e-9, p('map_check_gain_min'),
+            p('map_check_width_max'), p('map_check_k'), p('map_check_fit_bad'), p('map_check_gain_clear'),
+            p('map_check_fit_clear'), p('map_check_k_clear'), p('map_check_min_on_s'))
+        self.mc_budget = CpuBudget(p('map_check_budget_ms'), p('map_check_max_every'))
+        self.mc_stats = self.new_mc_stats()
         self.scans = deque(maxlen=40)       # recent scans: (t_ns, msg)
         self.last_refuse_log = -1e9
         self.fault = None                   # test_fault (global EKF only)
         self.fault_t0 = None
         tf_ = str(p('test_fault')).strip()
-        if tf_ and self.global_mode:
+        if tf_ and self.global_mode and not self.allow_test_faults:
+            self.get_logger().error(f"test_fault '{tf_}' IGNORED: the test switches are locked "
+                                    '(allow_test_faults false -- only the simulator launch files set it)')
+        elif tf_ and self.global_mode:
             vals = [float(v) for v in tf_.split(',')]
             if len(vals) != 4:
                 raise ValueError("test_fault must be 't_s,dx,dy,dyaw_deg'")
@@ -619,10 +718,12 @@ class EkfNode(Node):
         self.path.header.frame_id = p('frame_id')
         self.tf_pub = TransformBroadcaster(self) if p('publish_tf') else None
 
-        # In-process consumers (state_pipeline): called with every published odometry and with
-        # the NIS message of every ACCEPTED AMCL fix -- the same data the topics carry.
+        # In-process consumers (state_pipeline): called with every published odometry, with the NIS
+        # message of every ACCEPTED AMCL fix and (v0.3) with every map-check result -- the same data
+        # the topics carry.
         self.odom_hooks = []
         self.fix_hooks = []
+        self.map_check_hooks = []
         if own_inputs:
             self.create_subscription(Imu, '/imu/data', self.imu_cb, 100)
             self.create_subscription(AckermannDriveStamped, '/vehicle/measured', self.meas_cb, 50)
@@ -634,7 +735,7 @@ class EkfNode(Node):
                 self.create_subscription(OccupancyGrid, p('map_topic'), self.map_cb, QoSProfile(
                     depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                     reliability=ReliabilityPolicy.RELIABLE))
-            if p('use_amcl') and p('reset_scan_check'):
+            if p('use_amcl') and (p('reset_scan_check') or p('map_check')):
                 self.create_subscription(LaserScan, p('scan_topic'), self.scan_cb, qos_profile_sensor_data)
             tt = str(p('truth_topic')).strip()
             if tt and tt.lower() != 'none':
@@ -646,6 +747,8 @@ class EkfNode(Node):
         self.bias_sigma_pub = self.create_publisher(Float64, pre + '/bias_sigma', 10)
         self.scale_pub = self.create_publisher(Float64, pre + '/speed_scale', 10)
         self.nis_pub = self.create_publisher(Float64, pre + '/nis', 10)
+        self.mc_pub = (self.create_publisher(Float64MultiArray, pre + '/map_check', 10)
+                       if self.map_check_on else None)
         if p('path_period_s') > 0.0:
             self.create_timer(p('path_period_s'), self.publish_path)
         self.create_timer(2.0, self.report)
@@ -666,9 +769,36 @@ class EkfNode(Node):
                 + (f" AND the scan ({p('scan_topic')}) must fit AMCL's pose >= {p('reset_scan_min'):.2f} and "
                    f"{p('reset_scan_margin'):.2f} better than the EKF's" if p('reset_scan_check') else
                    ' (scan check OFF)'))
+        if self.map_check_on:
+            self.get_logger().info(
+                f"map check -> {pre}/map_check -> state_estimate FLAG_MAP_MISMATCH (contract v0.3): "
+                f"+-{p('map_check_max_shift'):.2f} m in {100 * p('map_check_step'):.0f} cm steps, {p('map_check_beams')} "
+                f"beams; BAD scan = |shift| >= {p('map_check_shift_min'):.2f} m with gain >= {p('map_check_gain_min'):.2f} "
+                f"and width <= {p('map_check_width_max'):.2f} m, or fit < {p('map_check_fit_bad'):.2f}; ON after "
+                f"{p('map_check_k')} BAD scans in a row; OFF after {p('map_check_k_clear')} CLEAN scans in a row (gain <= "
+                f"{p('map_check_gain_clear'):.2f}, fit >= {p('map_check_fit_clear'):.2f}) and >= "
+                f"{p('map_check_min_on_s'):.1f} s on; CPU budget {p('map_check_budget_ms'):.1f} ms per scan")
         if self.fault is not None:
             self.get_logger().warn(f'TEST FAULT armed: ekf_global pose will move by ({self.fault[1]}, '
                                    f'{self.fault[2]}) m, {self.fault[3]} deg, {self.fault[0]} s after the first IMU')
+        if self.allow_test_faults:
+            self.add_on_set_parameters_callback(self._on_set_test_kick)
+            self.get_logger().warn('TEST SWITCHES UNLOCKED (allow_test_faults true): test_fault / test_kick'
+                                   + (' / test_lag_ms' if self.global_mode else '') + ' -- simulator only')
+
+    def _on_set_test_kick(self, params):
+        """TEST ONLY (test_kick): arm a pose kick at runtime; it is applied at the next IMU message."""
+        from rcl_interfaces.msg import SetParametersResult
+        for prm in params:
+            if prm.name != 'test_kick' or not str(prm.value).strip():
+                continue
+            try:
+                dx, dy, dyaw = [float(v) for v in str(prm.value).split(',')]
+            except ValueError:
+                return SetParametersResult(successful=False, reason="test_kick must be 'dx,dy,dyaw_deg'")
+            self.fault, self.fault_t0 = [0.0, dx, dy, dyaw], None
+            self.get_logger().warn(f'TEST KICK armed: pose moves by ({dx}, {dy}) m, {dyaw} deg at the next IMU message')
+        return SetParametersResult(successful=True)
 
     # --- speed-scale calibration file ----------------------------------------
 
@@ -885,7 +1015,73 @@ class EkfNode(Node):
         return [scan_fit(self.wall_map, q, laser, ang, r, scan.range_max, p('scan_tol')) for q in poses]
 
     def scan_cb(self, msg):
-        self.scans.append((Time.from_msg(msg.header.stamp).nanoseconds, msg))
+        t_ns = Time.from_msg(msg.header.stamp).nanoseconds
+        self.scans.append((t_ns, msg))
+        if self.dfield is None:
+            return
+        if not self.get_parameter('map_check').value:   # switched off at runtime (ros2 param set)
+            if self.mc_monitor.alarm:                    # nothing could clear it any more -> clear it now
+                self.mc_monitor.reset()
+                self.get_logger().warn('MAP CHECK switched off while its alarm was on -> alarm cleared')
+                self.publish_map_check(t_ns, None, 0.0, float('nan'))
+            return
+        if self.mc_budget.due():
+            self.map_check(t_ns, msg)
+
+    def map_check(self, t_ns, scan):
+        """Map check of this scan (docstring MAP CHECK) -> MismatchAlarm -> topic + state_estimate."""
+        p = lambda n: self.get_parameter(n).value  # noqa: E731
+        t0 = self.mc_budget.start()
+        st = self.history.nearest(t_ns)
+        if st is None:
+            return
+        t_state, x = st
+        r, ang = scan_beams(scan.ranges, scan.angle_min, scan.angle_increment, scan.range_min,
+                            scan.range_max, int(p('map_check_beams')))
+        res = shift_search(self.dfield, x[:3], (p('laser_x'), p('laser_y'), p('laser_yaw')), ang, r,
+                           self.mc_shifts, tol=p('map_check_tol'))
+        mon = self.mc_monitor
+        was = mon.alarm
+        alarm = mon.update(res, t_ns * 1e-9)
+        ms = self.mc_budget.stop(t0)
+        s = self.mc_stats
+        s['runs'] += 1
+        s['ms'].append(ms)
+        if mon.last_class >= BAD_ALONG:
+            s['bad'] += 1
+        if res is not None:
+            s['last'] = res.shift
+        if alarm and not was:                       # BAD scans: res is not None
+            s['alarms'] += 1
+            if mon.cause == BAD_FIT:
+                why = (f'the scan fits the map only {res.fit0:.2f} at the EKF pose (sideways / heading error, or '
+                       f'more than {p("map_check_max_shift"):.1f} m off)')
+            else:
+                ahead = 'AHEAD of' if res.shift < 0 else 'BEHIND'
+                why = (f'the scan fits the map best {abs(res.shift):.2f} m along the heading from the EKF pose -> the '
+                       f'EKF is ~{abs(res.shift):.2f} m {ahead} the car (fit {res.fit0:.2f} -> {res.fit_best:.2f}, '
+                       f'optimum {res.width:.2f} m wide)')
+            self.get_logger().warn(f'MAP CHECK ALARM ({mon.n_bad} bad scans in a row): {why} '
+                                   '-> FLAG_MAP_MISMATCH, mode DEGRADED')
+        elif was and not alarm:                     # CLEAN scans: res is not None
+            s['cleared'] += 1
+            self.get_logger().info(f'MAP CHECK cleared: {mon.n_clean} clean scans in a row (fit {res.fit0:.2f}, '
+                                   f'gain {res.gain:.2f}) -> FLAG_MAP_MISMATCH off')
+        self.publish_map_check(t_ns, res, ms, (t_ns - t_state) * 1e-6)
+
+    def publish_map_check(self, t_ns, res, ms, state_age_ms):
+        """<diag_prefix>/map_check and the in-process hooks (state_pipeline -> state_estimate.map_check_cb)."""
+        nan = float('nan')
+        m = Float64MultiArray()
+        m.data = [t_ns * 1e-9,
+                  res.shift if res else nan, res.gain if res else nan, res.width if res else nan,
+                  res.fit0 if res else nan, float(res.n_beams) if res else 0.0,
+                  1.0 if self.mc_monitor.alarm else 0.0, float(ms), float(self.mc_budget.every_n),
+                  float(state_age_ms), float(self.mc_monitor.last_class)]
+        if self.mc_pub is not None:
+            self.mc_pub.publish(m)
+        for hook in self.map_check_hooks:
+            hook(m)
 
     def scan_at(self, t_ns, max_dt_ns=50_000_000):
         """The scan taken at t_ns (AMCL's pose carries the stamp of the scan it used)."""
@@ -908,6 +1104,13 @@ class EkfNode(Node):
                                               o.position.x, o.position.y)
             self.get_logger().info(f'scan check: map {info.width} x {info.height} cells @ {info.resolution:.3f} m, '
                                    f'{int(self.wall_map.occ.sum())} wall cells')
+            if self.map_check_on:
+                # in a BACKGROUND THREAD: numpy without scipy needs 0.1-0.23 s on the laptop (more on a Pi), and
+                # inside this callback that stalled the whole estimator (single-threaded executor) that long
+                data = np.asarray(msg.data, dtype=np.int16).copy()
+                geo = (info.width, info.height, info.resolution, o.position.x, o.position.y)
+                threading.Thread(target=self._build_dfield, args=(data, geo), daemon=True,
+                                 name='map_check_field').start()
         off, res = self.get_parameter('amcl_offset_m').value, msg.info.resolution
         if abs(off - 0.5 * res) > 1e-4:
             self.get_logger().warn(
@@ -915,6 +1118,18 @@ class EkfNode(Node):
                 f'{0.5 * res:.4f} m (nav2 AMCL half-cell offset, see the ekf_node docstring)')
         else:
             self.get_logger().info(f'amcl_offset_m {off:.4f} m = half the map resolution ({res:.3f} m): OK')
+
+    def _build_dfield(self, data, geo):
+        """Background thread (map_cb): the map check starts with the first scan after this finishes."""
+        t0 = time.perf_counter()
+        try:
+            field = DistanceField.from_grid(data, *geo)
+        except Exception as ex:                     # noqa: BLE001 -- the check must never stop the estimator
+            self.get_logger().error(f'map check: distance field FAILED ({ex}) -> no map check, no FLAG_MAP_MISMATCH')
+            return
+        self.dfield = field                         # one reference assignment: atomic for scan_cb
+        self.get_logger().info(f'map check: distance field built in {1000 * (time.perf_counter() - t0):.0f} ms '
+                               f'(background thread, {field.n_walls} wall cells)')
 
     def truth_cb(self, msg):
         self.truth = msg
@@ -1008,6 +1223,15 @@ class EkfNode(Node):
             fit = self.scan_fit_now()
             if fit is not None:
                 line += f' | scan fit {fit:.2f}'
+            mc = self.mc_stats
+            if self.map_check_on and self.dfield is None:
+                line += ' | map check: NO MAP / distance field yet'
+            elif self.map_check_on and mc['runs']:
+                line += (f" | map check {mc['runs']} scans, bad {mc['bad']}, ALARMS {mc['alarms']}, cleared "
+                         f"{mc['cleared']}{' (ALARM ON)' if self.mc_monitor.alarm else ''}, last shift "
+                         f"{mc['last']:+.2f} m, {np.mean(mc['ms']):.2f} ms (max {max(mc['ms']):.2f}), "
+                         f"every {self.mc_budget.every_n}")
+            self.mc_stats = self.new_mc_stats()
         line += f' | ZUPTs {self.zupt_count}'
         self.stats = self.new_stats()
         self.get_logger().info(line)
@@ -1016,6 +1240,10 @@ class EkfNode(Node):
     def new_stats():
         return {'acc': 0, 'rej': 0, 'nis': 0.0, 'amcl_err': [], 'unsure': 0, 'corridor': 0, 'refused': 0,
                 'jumps': 0}
+
+    @staticmethod
+    def new_mc_stats():
+        return {'runs': 0, 'bad': 0, 'alarms': 0, 'cleared': 0, 'last': float('nan'), 'ms': []}
 
     def scan_fit_now(self):
         """Health check every 2 s: how well does the latest scan fit the map at the EKF's

@@ -19,6 +19,8 @@ and waypoints (the test driver's path, '' = levine_centerline.csv) -- 2026-10-06
     (the simulator must run the same map: sim_perception.launch.py config:=<sim yaml with that map>)
 ekf_test_fault (TEST ONLY, 2026-10-06): 't_s,dx,dy,dyaw_deg' moves ekf_global's pose once -> tests
 the robust jump to AMCL; '' (default) = off.
+allow_test_faults (2026-10-24, default true in the simulator): unlocks the TEST-only fault switches
+(ekf_global test_fault / test_kick, state_pipeline test_lag_ms); false = locked, as on the real car.
 Test driver speed profile (2026-10-18, racing-speed runs): a_lat (sideways acceleration allowed in
 corners, m/s^2, default 1.5), v_min (default 0.7), a_brake / a_accel (m/s^2; default 0 = the old
 "corner speed 2 m ahead" rule; > 0 = brake early enough at a_brake, accelerate at most a_accel):
@@ -58,6 +60,7 @@ def generate_launch_description():
                           'steer_calib_file': LaunchConfiguration('steer_calib_file'),
                           'track': LaunchConfiguration('track'),
                           'ekf_test_fault': LaunchConfiguration('ekf_test_fault'),
+                          'allow_test_faults': LaunchConfiguration('allow_test_faults'),
                           'beta_model': LaunchConfiguration('beta_model'),
                           'slip_k': LaunchConfiguration('slip_k'),
                           'slip_file': LaunchConfiguration('slip_file'),
@@ -99,6 +102,7 @@ def generate_launch_description():
         DeclareLaunchArgument('track', default_value='levine'),         # apex_track track (2026-10-06)
         DeclareLaunchArgument('waypoints', default_value=''),           # '' = levine_centerline.csv
         DeclareLaunchArgument('ekf_test_fault', default_value=''),      # TEST ONLY, see sim_localization
+        DeclareLaunchArgument('allow_test_faults', default_value='true'),  # simulator: test switches unlocked
         DeclareLaunchArgument('beta_model', default_value='slip'),      # sideslip model (2026-10-18): slip | steer
         DeclareLaunchArgument('slip_k', default_value='-1.0'),          # s^2/m; < 0 = from slip_file
         DeclareLaunchArgument('slip_file', default_value='~/.ros/vehicle_slip.yaml'),

@@ -113,7 +113,7 @@ def _ekfs_and_state_estimate(context):
         'x0': float(arg('x0')), 'y0': float(arg('y0')), 'yaw0': float(arg('yaw0')),
         'odom_topic': '/odom/ekf', 'path_topic': '/odom/ekf_path',
         'diag_prefix': '/ekf', 'truth_topic': arg('ekf_truth_topic'),
-        'test_fault': arg('ekf_test_fault')})
+        'test_fault': arg('ekf_test_fault'), 'allow_test_faults': yes('allow_test_faults')})
     with_se = yes('state_estimate')
     pipeline = arg('pipeline').lower()
 
@@ -204,6 +204,10 @@ def generate_launch_description():
         # TEST ONLY (2026-10-06): 't_s,dx,dy,dyaw_deg' moves ekf_global's pose once, t_s s after its
         # first IMU message -> tests the robust jump to AMCL (ekf_node RECOVERY). '' = off (always, normally)
         DeclareLaunchArgument('ekf_test_fault', default_value=''),
+        # TEST ONLY switches (ekf_global test_fault / test_kick, state_pipeline test_lag_ms) are LOCKED unless
+        # this is true (2026-10-24). This is the SIMULATOR launch, so true here; the real car's launch must
+        # leave it out (node default false).
+        DeclareLaunchArgument('allow_test_faults', default_value='true'),
         # AMCL along-track slide (2026-10-19, docstring): wheel-speed delay [s] for both EKFs
         # (-1 = compensation off) and AMCL's thin-wall map copy
         DeclareLaunchArgument('wheel_delay', default_value='0.010'),

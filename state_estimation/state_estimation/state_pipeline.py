@@ -16,9 +16,9 @@ WHAT CHANGES -- AND WHAT DOES NOT
     new     ONE subscription to /imu/data and ONE to /vehicle/measured. Each
             message goes to the three as a plain function call, state_estimate
             first (its freshness check then sees the newest IMU / wheel sample).
-    new     ekf_global hands every odometry it publishes, and the NIS of every
-            accepted AMCL fix, DIRECTLY to state_estimate (both are still published
-            too, for eval_logger and other tools). /state_estimate therefore leaves
+    new     ekf_global hands every odometry it publishes, the NIS of every accepted
+            AMCL fix and (contract v0.3) every map-check result DIRECTLY to
+            state_estimate (all are still published too, for eval_logger and tools). /state_estimate therefore leaves
             in the same callback as the IMU sample: no extra hop between processes.
     new     one single-threaded executor: callbacks never run at the same time, so
             nothing needs a lock.
@@ -40,6 +40,7 @@ Real car: identical -- this is what should run on the Pi (inputs from the STM32
 bridge, the MPU-6050 driver and rplidar instead of the simulator).
 """
 import sys
+import time
 import traceback
 
 import rclpy
@@ -86,10 +87,28 @@ def main(args=None):
         nodes.append(se)
         glob.odom_hooks.append(guarded(se, se.odom_cb, 'state_estimate.odom_cb'))
         glob.fix_hooks.append(guarded(se, se.fix_cb, 'state_estimate.fix_cb'))
+        glob.map_check_hooks.append(guarded(se, se.map_check_cb, 'state_estimate.map_check_cb'))
         se_imu = guarded(se, se.imu_cb, 'state_estimate.imu_cb')
         se_wheel = guarded(se, se.wheel_cb, 'state_estimate.wheel_cb')
 
+    # TEST ONLY (2026-10-20, fault scenarios for control): extra work per IMU message = a busy CPU
+    # (job 167 r60: the laptop was overloaded and this process fell 0.34 s behind). Runtime:
+    # ros2 param set /ekf_global test_lag_ms 12.0   (> 10 ms per 100 Hz message -> the process falls behind)
+    # LOCKED (2026-10-24): only when ekf_global's allow_test_faults is true (the simulator launch files);
+    # otherwise test_lag_ms is not declared and on_imu does not even read it (no cost on the car).
+    test_switches = glob.allow_test_faults
+    if test_switches:
+        glob.declare_parameter('test_lag_ms', 0.0)
+    lag_on = [0.0]
+
     def on_imu(msg):                             # 100 Hz (sim) / 200 Hz (real car)
+        if test_switches:
+            lag = float(glob.get_parameter('test_lag_ms').value)
+            if lag != lag_on[0]:
+                lag_on[0] = lag
+                glob.get_logger().warn(f'TEST: estimator lag {lag:.1f} ms extra work per IMU message')
+            if lag > 0.0:
+                time.sleep(lag / 1000.0)
         if se_imu:
             se_imu(msg)                          # freshness first
         local.imu_cb(msg)                        # -> TF odom -> est/base_link (for AMCL)
