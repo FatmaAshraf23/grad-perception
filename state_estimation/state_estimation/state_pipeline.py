@@ -88,6 +88,7 @@ def main(args=None):
         glob.odom_hooks.append(guarded(se, se.odom_cb, 'state_estimate.odom_cb'))
         glob.fix_hooks.append(guarded(se, se.fix_cb, 'state_estimate.fix_cb'))
         glob.map_check_hooks.append(guarded(se, se.map_check_cb, 'state_estimate.map_check_cb'))
+        glob.slip_hooks.append(guarded(se, se.slip_cb, 'state_estimate.slip_cb'))      # Fix 3, 2026-10-26
         se_imu = guarded(se, se.imu_cb, 'state_estimate.imu_cb')
         se_wheel = guarded(se, se.wheel_cb, 'state_estimate.wheel_cb')
 

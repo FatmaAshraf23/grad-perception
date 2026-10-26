@@ -96,7 +96,10 @@ def _ekfs_and_state_estimate(context):
     common = dict(slip, **{'path_period_s': float(arg('ekf_path_period')), 'scale_file': arg('scale_file'),
                            'steer_calib_file': arg('steer_calib_file'),
                            'wheel_delay_s': float(arg('wheel_delay')), 'zupt_gate': float(arg('zupt_gate')),
-                           'zupt_turn_max_s': float(arg('zupt_turn_max_s'))})
+                           'zupt_turn_max_s': float(arg('zupt_turn_max_s')),
+                           # wheel-slip check (Fix 3): A/B switches + the SIMULATOR-ONLY artifact gate
+                           'slip_check': yes('slip_check'), 'slip_use_observer': yes('slip_use_observer'),
+                           'sim_wheel_ideal_topic': '/sim/wheel_ideal'})
     se = dict(slip, **{'steer_calib_file': arg('steer_calib_file'), 'track': arg('track'),
                        'initialpose_topic': arg('initialpose_topic')})
     # LOCAL EKF: odometry for AMCL, starts at the origin of the odom frame
@@ -213,6 +216,10 @@ def generate_launch_description():
         # this is true (2026-10-24). This is the SIMULATOR launch, so true here; the real car's launch must
         # leave it out (node default false).
         DeclareLaunchArgument('allow_test_faults', default_value='true'),
+        # wheel-slip check (2026-10-26, Fix 3, ekf_node UPDATE 3): false = off (the old odometry);
+        # slip_use_observer false = flag only, the EKFs keep the wheel speed
+        DeclareLaunchArgument('slip_check', default_value='true'),
+        DeclareLaunchArgument('slip_use_observer', default_value='true'),
         # AMCL along-track slide (2026-10-19, docstring): wheel-speed delay [s] for both EKFs
         # (-1 = compensation off) and AMCL's thin-wall map copy
         DeclareLaunchArgument('wheel_delay', default_value='0.010'),

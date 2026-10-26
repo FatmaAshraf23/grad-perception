@@ -235,19 +235,47 @@ MAP CHECK -- along-track position vs the LiDAR (global EKF only, 2026-10-21)  NE
     REAL CAR: the thresholds come from the simulator, where the LiDAR sees exactly the map;
     refit on real recordings (people near the walls, an imperfect map lower the fit).
 
+UPDATE 3 -- WHEEL-SLIP CHECK (both modes, 2026-10-26, Fix 3; slip_check.py)
+    Why: the prediction moves the car with the wheel speed. Fault F05 (wheel x 1.15 for 1 s = wheelspin) gave
+    90 cm of error, F06 (x 0.85 for 0.6 s = skid) 52 cm, and AMCL cannot see it on a straight (it moves its
+    particles with the same wheel odometry, from ekf_local).
+    What: slip_check.SlipCheck integrates the IMU's forward acceleration (a_x - accelerometer bias) to a second
+    speed, pulled gently towards the wheel while they agree; ON when the wheel (k * v_meas) differs from it by
+    > slip_r0 + slip_c_a * |a| for slip_k_on samples in a row (each wheel sample compared slip_lag_s later:
+    the simulated IMU lags ~30 ms more than the wheel). Bias learned at standstill AND while driving
+    (slip_ki_bias); OFF threshold grows with the slip's duration (slip_r_off_rate). Offline (36 recorded runs,
+    also with a 0.1 m/s^2 bias change while driving): 0 false alarms, F05/F06 detected after 40-53 ms, off
+    82-139 ms after the fault (slip_check docstring).
+    While ON (slip_use_observer true): predict(observer speed, use_k=False) -- the speed in TRUE m/s, the wheel
+    scale k has no part in it (otherwise AMCL fixes during a slip would "learn" a wrong wheel scale), speed
+    noise slip_sigma_v instead of sigma_v; standstill (ZUPT) is NOT decided while ON (a locked wheel during
+    hard braking reads 0 while the car still slides); the odometry twist carries the observer speed.
+    slip_use_observer false = flag only (shadow mode for the first real-car runs).
+    Out: <diag_prefix>/slip (one per decided wheel sample) and slip_hooks (state_pipeline -> state_estimate
+    FLAG_WHEEL_SLIP (8) -> DEGRADED); log lines 'WHEEL SLIP: ...' / 'wheel slip over after ...'.
+    SIMULATOR ARTIFACT: with fake_vehicle_sensors v3 the simulated wheel dips when the simulator runs slower
+    than real time (looks exactly like a skid; 2-14 % of clean driving). sim_wheel_ideal_topic (sim launch:
+    /sim/wheel_ideal) feeds slip_check.SimGate, which suppresses decisions there. '' on the real car.
+    REAL CAR: measure slip_lag_s (wheel vs IMU step test), mount the IMU near the centre (or correct the lever
+    arm), refit slip_r0 above the normal tyre slip of hard acceleration; start with slip_use_observer false.
+
 Topics
-  in : /imu/data (gyro z; + accel x/y with wheel_delay_s >= 0), /vehicle/measured,
+  in : /imu/data (gyro z; + accel x/y with wheel_delay_s >= 0 or slip_check), /vehicle/measured,
        /amcl_pose (global), /initialpose (global)
        <map_topic> (global, read once: checks amcl_offset_m against the resolution;
                     the walls for the scan check), <scan_topic> (global, scan check)
        <truth_topic> (global, simulation truth for the 2-s report only;
                       default 'none' = off -- the real car has no truth)
+       <sim_wheel_ideal_topic> (SIMULATOR ONLY, geometry_msgs/TwistStamped from fake_vehicle_sensors; '' = off)
   out: <odom_topic>, <path_topic> (only if path_period_s > 0; for viewing),
        <diag_prefix>/bias, /bias_sigma, /speed_scale, /nis ;
        <diag_prefix>/map_check (global; std_msgs/Float64MultiArray, one per checked scan:
            [scan stamp s, shift m, gain, width m, fit0, beams, alarm 0/1, cost ms, every_n,
             state age ms, scan class (-1 no result, 0 neither, 1 clean, 2 bad along, 3 bad fit,
             4 both; v0.3)]; shift > 0 = the EKF is BEHIND, nan = too few returns) ;
+       <diag_prefix>/slip (slip_check; std_msgs/Float64MultiArray, one per decided wheel sample:
+           [wheel stamp s, slip 0/1, wheel speed k*v m/s, observer speed m/s, residual m/s, threshold m/s,
+            accelerometer bias m/s^2, gated samples so far]) ;
        TF odom -> est/base_link (local only)
 
 CPU (2026-10-03): in Python ROS 2 the cost is mostly MESSAGES, not math. The sim
@@ -290,8 +318,12 @@ class LocalizationEKF:
 
     # --- prediction ----------------------------------------------------------
 
-    def predict(self, v_meas, w_meas, beta, dt):
+    def predict(self, v_meas, w_meas, beta, dt, use_k=True, sigma_v=None):
+        """use_k False (wheel slip, docstring UPDATE 3): v_meas is already a TRUE speed (the IMU observer), the
+        wheel scale k takes no part (no k in the motion, no k column in F). sigma_v: speed noise override."""
         px, py, yaw, b, k = self.x
+        if not use_k:
+            k = 1.0
         v = k * v_meas
         heading = yaw + beta
         c, s = math.cos(heading), math.sin(heading)
@@ -303,14 +335,16 @@ class LocalizationEKF:
         F = np.eye(self.N)
         F[0, 2] = -v * s * dt
         F[1, 2] = v * c * dt
-        F[0, 4] = v_meas * c * dt
-        F[1, 4] = v_meas * s * dt
+        if use_k:
+            F[0, 4] = v_meas * c * dt
+            F[1, 4] = v_meas * s * dt
         F[2, 3] = -dt
         G = np.zeros((self.N, 2))
         G[0, 0] = k * c * dt
         G[1, 0] = k * s * dt
         G[2, 1] = dt
-        Qu = np.diag([self.sigma_v ** 2, self.sigma_w ** 2])
+        sv = self.sigma_v if sigma_v is None else sigma_v
+        Qu = np.diag([sv ** 2, self.sigma_w ** 2])
         self.P = F @ self.P @ F.T + G @ Qu @ G.T
         self.P[self.B, self.B] += self.sigma_bw ** 2 * dt
         self.P[self.K, self.K] += self.sigma_kw ** 2 * dt
@@ -607,7 +641,7 @@ def motion_consistent(streak, tol_pos, tol_frac, tol_yaw):
 try:
     import rclpy
     from ackermann_msgs.msg import AckermannDriveStamped
-    from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, TransformStamped
+    from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, TransformStamped, TwistStamped
     from nav_msgs.msg import OccupancyGrid, Odometry, Path
     from rclpy.node import Node
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
@@ -619,6 +653,7 @@ try:
     from state_estimation.calibration import load_steering
     from state_estimation.map_check import (BAD_ALONG, BAD_FIT, CpuBudget, DistanceField, MismatchAlarm, make_shifts,
                                             shift_search)
+    from state_estimation.slip_check import SimGate, SlipCheck
     from state_estimation.vehicle_model import sideslip_from_params
     from state_estimation.wheel_delay import WheelSpeedCompensator
 except ImportError:
@@ -733,6 +768,23 @@ class EkfNode(Node):
         d('zupt_turn_max_s', 3.0)           # a standstill "turn" longer than this = the gyro bias changed (docstring
                                             # UPDATE 1); 0 = no limit
         d('initialpose_topic', '/initialpose')  # global EKF: where a start pose comes from (sim tests: /initialpose_est)
+        # Wheel-slip check (2026-10-26, Fix 3, docstring UPDATE 3, slip_check.py)
+        d('slip_check', True)               # detect wheel slip (wheel vs IMU forward acceleration)
+        d('slip_use_observer', True)        # while slipping predict with the IMU speed (false = flag only)
+        d('slip_sigma_v', 0.15)             # m/s: speed noise while predicting with the IMU speed
+        d('slip_lag_s', 0.03)               # s: each wheel sample is compared with the IMU speed this much later
+        d('slip_tau_s', 0.5)                # s: pull of the IMU speed towards the trusted wheel
+        d('slip_r0', 0.20)                  # m/s: ON threshold ...
+        d('slip_c_a', 0.03)                 # s    ... + this * |acceleration|
+        d('slip_k_on', 2)                   # ... in this many wheel samples in a row
+        d('slip_r_off', 0.10)               # m/s: OFF threshold ...
+        d('slip_r_off_rate', 0.05)          # m/s per s of slip ... growing (max 0.9 * slip_r0) ...
+        d('slip_k_off', 5)                  # ... in this many samples in a row ...
+        d('slip_min_on_s', 0.2)             # ... and on at least this long
+        d('slip_max_on_s', 3.0)             # s: longer -> give up, re-sync to the wheel
+        d('slip_imu_gap_s', 0.05)           # s: IMU gap -> re-sync to the wheel
+        d('slip_ki_bias', 0.3)              # 1/s^2: accelerometer-bias learning while driving (0 = standstill only)
+        d('sim_wheel_ideal_topic', '')      # SIMULATOR ONLY: /sim/wheel_ideal (artifact gate); '' on the real car
         # Steering calibration (steer_calib); 'none' = use the measured steering as it is
         d('steer_calib_file', '~/.ros/steering_calibration.yaml')
         # Speed-scale calibration file (see docstring)
@@ -776,11 +828,26 @@ class EkfNode(Node):
 
         self.v = 0.0
         self.v_used = 0.0                   # the speed the EKF predicts with (v + delay compensation)
+        self.speed_used = 0.0               # ... in TRUE m/s (k * v_used, or the IMU speed while slipping)
         self.steer = 0.0
         self.stopped_since = None
         self.last_imu_t = None
         self.still = StandstillTurns(gate=p('zupt_gate'), max_turn_s=p('zupt_turn_max_s'),
                                      sigma_bias0=p('sigma_bias0'))      # standstill gate (docstring UPDATE 1)
+        # wheel-slip check (docstring UPDATE 3)
+        self.slip = None
+        self.slip_gate = None
+        self.slip_use = bool(p('slip_use_observer'))
+        self.slip_sigma_v = float(p('slip_sigma_v'))
+        self.slip_hooks = []                # state_pipeline: ekf_global -> state_estimate.slip_cb
+        ideal_topic = str(p('sim_wheel_ideal_topic')).strip()
+        if p('slip_check'):
+            self.slip_gate = SimGate() if ideal_topic else None
+            self.slip = SlipCheck(lag=p('slip_lag_s'), tau=p('slip_tau_s'), r0=p('slip_r0'), c_a=p('slip_c_a'),
+                                  r_off=p('slip_r_off'), k_on=p('slip_k_on'), k_off=p('slip_k_off'),
+                                  min_on=p('slip_min_on_s'), max_on=p('slip_max_on_s'), gap=p('slip_imu_gap_s'),
+                                  sim_gate=self.slip_gate, ki_bias=p('slip_ki_bias'),
+                                  r_off_rate=p('slip_r_off_rate'))
         self.distance = 0.0
         self.truth = None
         self.truth_hist = deque(maxlen=400)
@@ -847,6 +914,21 @@ class EkfNode(Node):
         self.nis_pub = self.create_publisher(Float64, pre + '/nis', 10)
         self.mc_pub = (self.create_publisher(Float64MultiArray, pre + '/map_check', 10)
                        if self.map_check_on else None)
+        self.slip_pub = (self.create_publisher(Float64MultiArray, pre + '/slip', 10)
+                         if self.slip is not None else None)
+        if self.slip_gate is not None:      # SIMULATOR ONLY (docstring UPDATE 3)
+            self.create_subscription(TwistStamped, ideal_topic, self.wheel_ideal_cb, 50)
+        if self.slip is not None:
+            self.get_logger().info(
+                f"wheel-slip check -> {pre}/slip" + (' -> state_estimate FLAG_WHEEL_SLIP' if self.global_mode else '')
+                + f": ON when |k*wheel - IMU speed| > {p('slip_r0'):.2f} m/s + {p('slip_c_a'):.2f} s * |a| for "
+                f"{p('slip_k_on')} samples (compared {1000 * p('slip_lag_s'):.0f} ms later); while ON "
+                + (f"predict with the IMU speed (sigma_v {self.slip_sigma_v:.2f} m/s)" if self.slip_use
+                   else 'FLAG ONLY (slip_use_observer false)')
+                + (f"; SIMULATOR artifact gate on {ideal_topic}" if self.slip_gate is not None else
+                   '; no simulator gate'))
+        else:
+            self.get_logger().warn('wheel-slip check OFF (slip_check false)')
         if p('path_period_s') > 0.0:
             self.create_timer(p('path_period_s'), self.publish_path)
         self.create_timer(2.0, self.report)
@@ -961,6 +1043,10 @@ class EkfNode(Node):
         self.v = msg.drive.speed
         self.steer = self.steer_cal.correct(msg.drive.steering_angle)
         now = Time.from_msg(msg.header.stamp)
+        if self.slip is not None:           # wheel in TRUE m/s (docstring UPDATE 3)
+            for row in self.slip.wheel(now.nanoseconds * 1e-9, float(self.ekf.x[4]) * self.v):
+                self.publish_slip(row)
+            self.log_slip()
         if self.wheel_comp is not None:
             self.wheel_comp.on_wheel(now.nanoseconds * 1e-9)
         if abs(self.v) < self.get_parameter('stopped_speed').value:
@@ -985,21 +1071,32 @@ class EkfNode(Node):
         if dt <= 0.0 or dt > 0.5:
             return
         w_m = msg.angular_velocity.z
-        stopped = self.is_stopped(t)
+        a = msg.linear_acceleration
+        slipping = False
+        if self.slip is not None:           # docstring UPDATE 3
+            self.slip.imu(t.nanoseconds * 1e-9, self.imu_c * a.x - self.imu_s * a.y)
+            self.log_slip()
+            slipping = self.slip.on
+        stopped = self.is_stopped(t) and not slipping     # locked wheels while slipping: NOT parked
         self.v_used = self.v
         if self.wheel_comp is not None:     # speed gained since the wheel value was true (true m/s)
             a = msg.linear_acceleration
             dv = self.wheel_comp.on_imu(t.nanoseconds * 1e-9, self.imu_c * a.x - self.imu_s * a.y, dt, stopped)
             self.v_used = self.v + dv / max(float(self.ekf.x[4]), 0.5)      # raw units, as v
+        use_obs = slipping and self.slip_use
+        self.speed_used = self.slip.observer_speed if use_obs else float(self.ekf.x[4]) * self.v_used
 
         if stopped:                         # ZUPT, or a turn while standing (docstring UPDATE 1)
             self.log_standstill(self.still.step(self.ekf, w_m, dt))
         else:
             self.log_standstill(self.still.moving())
             # sideslip (vehicle_model): 'steer' = kinematic from the steering, 'slip' = gyro + tyre slip
-            beta = self.sideslip.beta(self.ekf.x[4] * self.v_used, w_m - self.ekf.x[3], self.steer)
-            self.ekf.predict(self.v_used, w_m, beta, dt)
-            self.distance += abs(self.ekf.x[4] * self.v_used) * dt
+            beta = self.sideslip.beta(self.speed_used, w_m - self.ekf.x[3], self.steer)
+            if use_obs:                     # wheel slip: the IMU speed, true m/s, no wheel scale (UPDATE 3)
+                self.ekf.predict(self.speed_used, w_m, beta, dt, use_k=False, sigma_v=self.slip_sigma_v)
+            else:
+                self.ekf.predict(self.v_used, w_m, beta, dt)
+            self.distance += abs(self.speed_used) * dt
 
         if self.fault is not None:                  # TEST ONLY (test_fault)
             if self.fault_t0 is None:
@@ -1030,6 +1127,35 @@ class EkfNode(Node):
             lg.warn(f'STANDSTILL "TURN" LASTED {ev[2]:.1f} s (> zupt_turn_max_s {self.still.max_turn_s:g}): taken as a '
                     f'GYRO-BIAS CHANGE, not a hand turn -> its heading change of {ev[1]:+.1f} deg undone, the bias '
                     f'({ev[3]:+.2f} deg/s) is learned again')
+
+    def wheel_ideal_cb(self, msg):
+        """SIMULATOR ONLY: /sim/wheel_ideal -> slip_check.SimGate (docstring UPDATE 3)."""
+        self.slip_gate.update(Time.from_msg(msg.header.stamp).nanoseconds * 1e-9,
+                              msg.twist.linear.x, msg.twist.linear.y)
+
+    def publish_slip(self, row):
+        """<diag_prefix>/slip + slip_hooks (state_pipeline -> state_estimate.slip_cb), one per decided wheel sample."""
+        tw, z, vr, r, thr, on = row
+        m = Float64MultiArray()
+        m.data = [float(tw), 1.0 if on else 0.0, float(z), float(vr), float(r), float(thr),
+                  float(self.slip.bias), float(self.slip.gated_n)]
+        if self.slip_pub is not None:
+            self.slip_pub.publish(m)
+        for hook in self.slip_hooks:
+            hook(m)
+
+    def log_slip(self):
+        """One log line per slip ON / OFF (docstring UPDATE 3)."""
+        for t_s, on, why, r in self.slip.pop_events():
+            if on:
+                self.slip_t_on = t_s
+                what = (f'the EKF predicts with the IMU speed {self.slip.observer_speed:.2f} m/s'
+                        if self.slip_use else 'FLAG ONLY')
+                self.get_logger().warn(f'WHEEL SLIP: {why} (wheel {float(self.ekf.x[4]) * self.v:.2f} m/s) -> {what}')
+            else:
+                dur = t_s - getattr(self, 'slip_t_on', t_s)
+                self.get_logger().info(f'wheel slip over after {dur:.2f} s: {why} (residual {r:+.2f} m/s, '
+                                       f'accelerometer bias {self.slip.bias:+.3f} m/s^2)')
 
     def amcl_cb(self, msg):
         p = lambda n: self.get_parameter(n).value  # noqa: E731
@@ -1277,7 +1403,7 @@ class EkfNode(Node):
         cov[6], cov[7], cov[11] = P[1, 0], P[1, 1], P[1, 2]
         cov[30], cov[31], cov[35] = P[2, 0], P[2, 1], P[2, 2]
         odom.pose.covariance = [float(c) for c in cov]
-        odom.twist.twist.linear.x = k * self.v_used          # with the delay compensation (if on)
+        odom.twist.twist.linear.x = self.speed_used          # k * v_used (delay comp.), or the IMU speed while slipping
         odom.twist.twist.angular.z = float(w_m) - b
         self.odom_pub.publish(odom)
         for hook in self.odom_hooks:
@@ -1346,6 +1472,11 @@ class EkfNode(Node):
                          f"{mc['last']:+.2f} m, {np.mean(mc['ms']):.2f} ms (max {max(mc['ms']):.2f}), "
                          f"every {self.mc_budget.every_n}")
             self.mc_stats = self.new_mc_stats()
+        if self.slip is not None:
+            sl = self.slip
+            line += (f' | slip episodes {sl.episodes}, on {sl.on_s:.1f} s, accel bias {sl.bias:+.3f}'
+                     + (f', sim-gated {sl.gated_n}' if self.slip_gate is not None else '')
+                     + (' (SLIP ON)' if sl.on else ''))
         st = self.still
         line += f' | ZUPTs {st.zupts}' + (f' | turned while standing: {st.turn_samples} samples' if st.turn_samples
                                           else '') + (f', bias changes {st.bias_changes}' if st.bias_changes else '')

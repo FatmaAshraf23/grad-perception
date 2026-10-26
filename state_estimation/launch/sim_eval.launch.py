@@ -69,6 +69,8 @@ def generate_launch_description():
                           'amcl_corridor_sigma': LaunchConfiguration('amcl_corridor_sigma'),
                           'zupt_gate': LaunchConfiguration('zupt_gate'),
                           'zupt_turn_max_s': LaunchConfiguration('zupt_turn_max_s'),
+                          'slip_check': LaunchConfiguration('slip_check'),
+                          'slip_use_observer': LaunchConfiguration('slip_use_observer'),
                           'initialpose_topic': LaunchConfiguration('initialpose_topic')}.items(),
     )
     driver = Node(
@@ -115,6 +117,8 @@ def generate_launch_description():
         DeclareLaunchArgument('amcl_corridor_sigma', default_value='0.10'),  # m, 0 = off (2026-10-19)
         DeclareLaunchArgument('zupt_gate', default_value='16.0'),          # standstill gate, 0 = old rule (2026-10-24)
         DeclareLaunchArgument('zupt_turn_max_s', default_value='3.0'),     # longer standstill "turn" = bias change
+        DeclareLaunchArgument('slip_check', default_value='true'),         # wheel-slip check (Fix 3), false = off
+        DeclareLaunchArgument('slip_use_observer', default_value='true'),  # false = flag only
         DeclareLaunchArgument('initialpose_topic', default_value='/initialpose'),  # tests: /initialpose_est
         DeclareLaunchArgument('start_delay', default_value='3.0'),         # s parked before the test driver drives
         # CPU rule (also for test_driver and eval_logger, which start here)

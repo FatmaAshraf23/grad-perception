@@ -7,6 +7,7 @@ Turns the global EKF output into the message control consumes:
     /vehicle/measured (steering) ───────────┼─> this node ─> /state_estimate
     /ekf/nis (one per ACCEPTED AMCL fix) ───┤                (apex_msgs/StateEstimate)
     /ekf/map_check (v0.3, map mismatch) ────┤
+    /ekf/slip (Fix 3, wheel slip) ──────────┤
     /imu/data, /initialpose (health only) ──┘
                                      + apex_track (s_abs, e_y, e_psi, kappa)
 
@@ -28,8 +29,7 @@ WHAT IS HONEST AND WHAT IS STILL A PLACEHOLDER (v0, 2026-10-02)
     rough   std_vx, std_vy, std_r: simple parameter models until the EKF
             exports its own velocity uncertainty (racing-speed work)
     zero    ax, ay ("recommended" fields; not estimated yet)
-    unset   FLAG_OFF_TRACK (needs track widths in apex_track),
-            FLAG_WHEEL_SLIP (needs the a_x slip detector)
+    unset   FLAG_OFF_TRACK (needs track widths in apex_track)
 
 REFERENCE POINT
     The EKF propagates position along yaw + beta (the CG velocity direction of
@@ -42,7 +42,7 @@ MODES (contract section 6, thresholds provisional = parameters)
     INIT     until the first accepted AMCL correction and std_xy <= 0.15 m
     OK       std_xy <= 0.15 m and an accepted AMCL fix within the last 0.3 s of DRIVING
     DEGRADED std_xy 0.15-0.30 m, or 0.3-1.0 s of driving without an accepted fix,
-             or (v0.3) FLAG_MAP_MISMATCH, or (v0.3) FLAG_ESTIMATOR_LAG
+             or (v0.3) FLAG_MAP_MISMATCH, or (v0.3) FLAG_ESTIMATOR_LAG, or (Fix 3) FLAG_WHEEL_SLIP
     LOST     std_xy > 0.30 m, or > 1.0 s of driving without an accepted fix
     Priority INIT (until the first good fix) > LOST > DEGRADED > OK: the v0.3 checks can only turn OK
     into DEGRADED, never LOST into DEGRADED; their flags are set in every mode.
@@ -62,6 +62,12 @@ HEALTH CHECKS NEW IN CONTRACT v0.3 (2026-10-24; offline evidence: control_data/v
         every message is younger than lag_off_ms (10 ms) for lag_clear_s (1 s). lag_check false = off.
         A process that is completely stuck publishes nothing -> only control's own age check
         (now - stamp_us <= valid_for_ms) can notice that.
+    FLAG_WHEEL_SLIP (8, defined since v0.2, ACTIVE since 2026-10-26, Fix 3): ekf_global's wheel-slip check
+        (slip_check.SlipCheck: wheel speed vs the IMU's forward acceleration; ON after 2 wheel samples in a row
+        that disagree by > 0.20 m/s + 0.03 s * |a|). While it is on the EKFs move the car with the IMU speed
+        ("wheel de-weighted", as the contract says) and vx in this message is that speed. Delivered by
+        state_pipeline (ekf_global.slip_hooks -> slip_cb) or, as separate nodes, on slip_topic.
+        use_slip_check false = ignore it (shadow mode).
     valid_for_ms 50 (v0.2: 30): control's age limit, as control proposed (2026-10-21); provisional
         until measured on the Pi.
     schema_version 'apex-state-estimate/1.1': same fields, two new flag bits (minor version).
@@ -133,6 +139,8 @@ class StateEstimateNode(Node):
         d('use_map_check', True)               # FLAG_MAP_MISMATCH from ekf_global's map check -> DEGRADED
         d('map_check_topic', '/ekf/map_check') # separate nodes only (state_pipeline calls map_check_cb)
         d('lag_check', True)                   # FLAG_ESTIMATOR_LAG -> DEGRADED
+        d('use_slip_check', True)              # FLAG_WHEEL_SLIP from ekf_global's slip check -> DEGRADED (Fix 3)
+        d('slip_topic', '/ekf/slip')           # separate nodes only (state_pipeline calls slip_cb)
         d('lag_on_ms', 25.0)                   # ON: estimate older than this when published ...
         d('lag_k', 2)                          #     ... in this many messages in a row
         d('lag_off_ms', 10.0)                  # OFF: every message younger than this ...
@@ -177,7 +185,8 @@ class StateEstimateNode(Node):
         self.map_alarm = False                 # ekf_global's map-mismatch alarm (map_check_cb)
         self.map_checks = 0                    # map-check results received since the last report
         self.lag_mon = LagMonitor(p('lag_on_ms'), p('lag_k'), p('lag_off_ms'), p('lag_clear_s'))
-        self.flag_msgs = {'map': 0, 'lag': 0}  # messages published with the flag since the last report
+        self.wheel_slip = False                # ekf_global's wheel-slip flag (slip_cb, Fix 3)
+        self.flag_msgs = {'map': 0, 'lag': 0, 'slip': 0}  # messages published with the flag since the last report
 
         self.pub = self.create_publisher(SE, '/state_estimate', 10)
         if own_inputs:
@@ -186,6 +195,7 @@ class StateEstimateNode(Node):
             self.create_subscription(Imu, '/imu/data', self.imu_cb, 100)
             self.create_subscription(Float64, '/ekf/nis', self.fix_cb, 10)
             self.create_subscription(Float64MultiArray, p('map_check_topic'), self.map_check_cb, 10)
+            self.create_subscription(Float64MultiArray, p('slip_topic'), self.slip_cb, 50)
         self.create_subscription(PoseWithCovarianceStamped, p('initialpose_topic'), self.reset_cb, 10)
         self.create_timer(p('stats_every_s'), self.report)
 
@@ -209,6 +219,11 @@ class StateEstimateNode(Node):
         if len(msg.data) > 6:
             self.map_alarm = msg.data[6] > 0.5
             self.map_checks += 1
+
+    def slip_cb(self, msg):
+        """One decided wheel sample of ekf_global's slip check (Float64MultiArray; field 1 = slip 0/1, see ekf_node)."""
+        if len(msg.data) > 1:
+            self.wheel_slip = msg.data[1] > 0.5
 
     def reset_cb(self, _msg):
         self.reset_pending = True
@@ -300,6 +315,10 @@ class StateEstimateNode(Node):
         if lagging:
             flags |= SE.FLAG_ESTIMATOR_LAG
             self.flag_msgs['lag'] += 1
+        slipping = self.wheel_slip and bool(p('use_slip_check'))
+        if slipping:
+            flags |= SE.FLAG_WHEEL_SLIP
+            self.flag_msgs['slip'] += 1
 
         # mode
         if self.mode == SE.MODE_INIT and (self.last_fix_t is None or std_xy > p('std_ok_m')):
@@ -307,7 +326,7 @@ class StateEstimateNode(Node):
         elif std_xy > p('std_lost_m') or (lidar_stale and fix_age is not None
                                           and fix_age > p('lidar_lost_s')):
             mode = SE.MODE_LOST
-        elif std_xy > p('std_ok_m') or lidar_stale or mismatch or lagging:
+        elif std_xy > p('std_ok_m') or lidar_stale or mismatch or lagging or slipping:
             mode = SE.MODE_DEGRADED
         else:
             mode = SE.MODE_OK
@@ -371,11 +390,12 @@ class StateEstimateNode(Node):
             f'mean {lat.mean():.1f} p95 {np.percentile(lat, 95):.1f} max {lat.max():.1f} ms | '
             f'node work mean {proc.mean():.0f} us | modes: {modes} | lap {self.track.lap}'
             f" | v0.3: map checks {self.map_checks}{'' if self.get_parameter('use_map_check').value else ' (ignored)'}, "
-            f"MAP MISMATCH msgs {self.flag_msgs['map']}, LAG msgs {self.flag_msgs['lag']} "
+            f"MAP MISMATCH msgs {self.flag_msgs['map']}, LAG msgs {self.flag_msgs['lag']}, "
+            f"WHEEL SLIP msgs {self.flag_msgs['slip']}{'' if self.get_parameter('use_slip_check').value else ' (ignored)'} "
             f'(lag episodes so far {self.lag_mon.episodes})'
             + (f' | clock steps so far: {self.clock_steps}' if self.clock_steps else ''))
         self.lat_us, self.proc_us, self.mode_count = [], [], [0, 0, 0, 0]
-        self.map_checks, self.flag_msgs = 0, {'map': 0, 'lag': 0}
+        self.map_checks, self.flag_msgs = 0, {'map': 0, 'lag': 0, 'slip': 0}
 
 
 def main():

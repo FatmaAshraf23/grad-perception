@@ -19,12 +19,24 @@ true_speed, parameter `model`:
 Output: /vehicle/measured (ackermann_msgs/AckermannDriveStamped) at 50 Hz.
 On the real car this node is replaced by the STM32 bridge publishing the
 same topic, so everything downstream stays the same.
+
+SIMULATOR ONLY (2026-10-26, Fix 3 wheel-slip check): /sim/wheel_ideal
+(geometry_msgs/TwistStamped, same stamp as the /vehicle/measured message of the same tick):
+  twist.linear.x = what an error-free encoder would read = true_speed of the speed model
+                   (no scale error, no noise, no test_speed_factor)
+  twist.linear.y = the simulator's speed state (what fake_imu differentiates)
+Why: with model v3 the wheel follows the distance travelled per WALL-CLOCK second. When the
+simulator runs slower than real time, linear.x dips below linear.y (down to 0.59x) while the
+IMU shows nothing -> to the slip check this looks exactly like a skid (2-14 % of the driving
+time in the clean runs of job 204). The slip check ignores those moments (slip_check.SimGate).
+The real car has no such topic, and the EKF's sim_wheel_ideal_topic parameter is empty there.
 """
 import math
 import random
 
 import rclpy
 from ackermann_msgs.msg import AckermannDriveStamped
+from geometry_msgs.msg import TwistStamped
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
@@ -69,9 +81,10 @@ class FakeVehicleSensors(Node):
         self.create_subscription(Twist, '/cmd_vel', self.teleop_cb, 10)
         self.create_subscription(AckermannDriveStamped, '/drive', self.drive_cb, 10)
         self.pub = self.create_publisher(AckermannDriveStamped, '/vehicle/measured', 10)
+        self.pub_ideal = self.create_publisher(TwistStamped, '/sim/wheel_ideal', 10)   # SIMULATOR ONLY (Fix 3)
         self.create_timer(1.0 / self.get_parameter('rate_hz').value, self.publish)
         self.get_logger().info('Publishing simulated wheel speed + steering on /vehicle/measured '
-                               f'(speed model {self.model})')
+                               f'(speed model {self.model}); simulator only: /sim/wheel_ideal')
 
     def odom_cb(self, msg):
         vx = msg.twist.twist.linear.x
@@ -107,6 +120,11 @@ class FakeVehicleSensors(Node):
         out.header.frame_id = 'ego_racecar/base_link'
         true_speed = (self.speed_model.sample(now.nanoseconds * 1e-9) if self.model == 'v3'
                       else self.true_speed)
+        ideal = TwistStamped()                        # SIMULATOR ONLY (Fix 3): see the docstring
+        ideal.header = out.header
+        ideal.twist.linear.x = float(true_speed)
+        ideal.twist.linear.y = float(self.true_speed)
+        self.pub_ideal.publish(ideal)
         f = float(p('test_speed_factor'))
         if f != self.test_factor_on:                  # TEST ONLY: wheel slip switched on / off
             self.test_factor_on = f
