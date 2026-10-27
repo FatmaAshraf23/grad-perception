@@ -71,6 +71,7 @@ def generate_launch_description():
                           'zupt_turn_max_s': LaunchConfiguration('zupt_turn_max_s'),
                           'slip_check': LaunchConfiguration('slip_check'),
                           'slip_use_observer': LaunchConfiguration('slip_use_observer'),
+                          'imu_gap_predict': LaunchConfiguration('imu_gap_predict'),
                           'initialpose_topic': LaunchConfiguration('initialpose_topic')}.items(),
     )
     driver = Node(
@@ -119,6 +120,7 @@ def generate_launch_description():
         DeclareLaunchArgument('zupt_turn_max_s', default_value='3.0'),     # longer standstill "turn" = bias change
         DeclareLaunchArgument('slip_check', default_value='true'),         # wheel-slip check (Fix 3), false = off
         DeclareLaunchArgument('slip_use_observer', default_value='true'),  # false = flag only
+        DeclareLaunchArgument('imu_gap_predict', default_value='true'),    # IMU dropout prediction (Fix 2), false = off
         DeclareLaunchArgument('initialpose_topic', default_value='/initialpose'),  # tests: /initialpose_est
         DeclareLaunchArgument('start_delay', default_value='3.0'),         # s parked before the test driver drives
         # CPU rule (also for test_driver and eval_logger, which start here)

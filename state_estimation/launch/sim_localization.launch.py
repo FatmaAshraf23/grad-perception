@@ -99,7 +99,9 @@ def _ekfs_and_state_estimate(context):
                            'zupt_turn_max_s': float(arg('zupt_turn_max_s')),
                            # wheel-slip check (Fix 3): A/B switches + the SIMULATOR-ONLY artifact gate
                            'slip_check': yes('slip_check'), 'slip_use_observer': yes('slip_use_observer'),
-                           'sim_wheel_ideal_topic': '/sim/wheel_ideal'})
+                           'sim_wheel_ideal_topic': '/sim/wheel_ideal',
+                           # IMU dropout prediction (Fix 2): ON in the simulator only (node default false)
+                           'imu_gap_predict': yes('imu_gap_predict')})
     se = dict(slip, **{'steer_calib_file': arg('steer_calib_file'), 'track': arg('track'),
                        'initialpose_topic': arg('initialpose_topic')})
     # LOCAL EKF: odometry for AMCL, starts at the origin of the odom frame
@@ -220,6 +222,8 @@ def generate_launch_description():
         # slip_use_observer false = flag only, the EKFs keep the wheel speed
         DeclareLaunchArgument('slip_check', default_value='true'),
         DeclareLaunchArgument('slip_use_observer', default_value='true'),
+        # IMU dropout prediction from wheel + steering (2026-10-27, Fix 2, ekf_node UPDATE 4): false = the old behaviour
+        DeclareLaunchArgument('imu_gap_predict', default_value='true'),
         # AMCL along-track slide (2026-10-19, docstring): wheel-speed delay [s] for both EKFs
         # (-1 = compensation off) and AMCL's thin-wall map copy
         DeclareLaunchArgument('wheel_delay', default_value='0.010'),

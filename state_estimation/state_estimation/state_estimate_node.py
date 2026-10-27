@@ -8,6 +8,7 @@ Turns the global EKF output into the message control consumes:
     /ekf/nis (one per ACCEPTED AMCL fix) ───┤                (apex_msgs/StateEstimate)
     /ekf/map_check (v0.3, map mismatch) ────┤
     /ekf/slip (Fix 3, wheel slip) ──────────┤
+    /ekf/imu_gap (Fix 2, IMU dropout) ──────┤
     /imu/data, /initialpose (health only) ──┘
                                      + apex_track (s_abs, e_y, e_psi, kappa)
 
@@ -68,6 +69,16 @@ HEALTH CHECKS NEW IN CONTRACT v0.3 (2026-10-24; offline evidence: control_data/v
         ("wheel de-weighted", as the contract says) and vx in this message is that speed. Delivered by
         state_pipeline (ekf_global.slip_hooks -> slip_cb) or, as separate nodes, on slip_topic.
         use_slip_check false = ignore it (shadow mode).
+    IMU DROPOUT (Fix 2, 2026-10-27; contract Option A, approved by control for development + synthetic evaluation):
+        with ekf_node imu_gap_predict true the EKFs keep predicting from wheel + steering while the IMU is silent and
+        /odom/ekf arrives at the WHEEL rate, stamped with the wheel sample (stamp amendment pending with control).
+        ekf_global's imu_gap state (gap_hooks -> imu_gap_cb, or imu_gap_topic): while not OK (GAP, or RECOVERING =
+        the returning gyro not validated yet) FLAG_IMU_STALE (2) is set and the mode is at least DEGRADED; LOST once
+        there has been no TRUSTED gyro sample for more than imu_gap_lost_s (control: 50 ms, provisional); after the
+        recovery the mode stays DEGRADED until a fresh accepted AMCL fix (no automatic return to OK) -- if the car
+        MOVED during the dropout. A parked car cannot drift (and AMCL does not update while it stands), so then the
+        recovery is enough (job 207: otherwise a dropout on the start line blocked OK until the car drove).
+        use_imu_gap false = ignore it.
     valid_for_ms 50 (v0.2: 30): control's age limit, as control proposed (2026-10-21); provisional
         until measured on the Pi.
     schema_version 'apex-state-estimate/1.1': same fields, two new flag bits (minor version).
@@ -140,6 +151,9 @@ class StateEstimateNode(Node):
         d('map_check_topic', '/ekf/map_check') # separate nodes only (state_pipeline calls map_check_cb)
         d('lag_check', True)                   # FLAG_ESTIMATOR_LAG -> DEGRADED
         d('use_slip_check', True)              # FLAG_WHEEL_SLIP from ekf_global's slip check -> DEGRADED (Fix 3)
+        d('use_imu_gap', True)                 # IMU dropout state from ekf_global -> FLAG_IMU_STALE, DEGRADED / LOST (Fix 2)
+        d('imu_gap_topic', '/ekf/imu_gap')     # separate nodes only (state_pipeline calls imu_gap_cb)
+        d('imu_gap_lost_s', 0.05)              # s without a trusted gyro -> LOST (control, provisional)
         d('slip_topic', '/ekf/slip')           # separate nodes only (state_pipeline calls slip_cb)
         d('lag_on_ms', 25.0)                   # ON: estimate older than this when published ...
         d('lag_k', 2)                          #     ... in this many messages in a row
@@ -186,7 +200,11 @@ class StateEstimateNode(Node):
         self.map_checks = 0                    # map-check results received since the last report
         self.lag_mon = LagMonitor(p('lag_on_ms'), p('lag_k'), p('lag_off_ms'), p('lag_clear_s'))
         self.wheel_slip = False                # ekf_global's wheel-slip flag (slip_cb, Fix 3)
-        self.flag_msgs = {'map': 0, 'lag': 0, 'slip': 0}  # messages published with the flag since the last report
+        self.imu_gap_state = 0                 # ekf_global's IMU-dropout state (imu_gap_cb, Fix 2): 0 OK 1 GAP 2 RECOVERING
+        self.imu_gap_len = 0.0                 # s since its last trusted gyro sample
+        self.gap_need_fix = False              # after a dropout: OK only after a fresh accepted AMCL fix ...
+        self.gap_moved = False                 # ... if the car moved during the dropout / recovery
+        self.flag_msgs = {'map': 0, 'lag': 0, 'slip': 0, 'gap': 0}  # messages published with the flag since the last report
 
         self.pub = self.create_publisher(SE, '/state_estimate', 10)
         if own_inputs:
@@ -196,6 +214,7 @@ class StateEstimateNode(Node):
             self.create_subscription(Float64, '/ekf/nis', self.fix_cb, 10)
             self.create_subscription(Float64MultiArray, p('map_check_topic'), self.map_check_cb, 10)
             self.create_subscription(Float64MultiArray, p('slip_topic'), self.slip_cb, 50)
+            self.create_subscription(Float64MultiArray, p('imu_gap_topic'), self.imu_gap_cb, 50)
         self.create_subscription(PoseWithCovarianceStamped, p('initialpose_topic'), self.reset_cb, 10)
         self.create_timer(p('stats_every_s'), self.report)
 
@@ -213,6 +232,8 @@ class StateEstimateNode(Node):
     def fix_cb(self, _msg):
         self.last_fix_t = self.now_s()
         self.driven_since_fix = 0.0
+        if self.imu_gap_state == 0:            # a fresh fix after the dropout's recovery (Fix 2)
+            self.gap_need_fix = False
 
     def map_check_cb(self, msg):
         """One map-check result of ekf_global (Float64MultiArray; field 6 = the alarm 0/1, see ekf_node)."""
@@ -224,6 +245,16 @@ class StateEstimateNode(Node):
         """One decided wheel sample of ekf_global's slip check (Float64MultiArray; field 1 = slip 0/1, see ekf_node)."""
         if len(msg.data) > 1:
             self.wheel_slip = msg.data[1] > 0.5
+
+    def imu_gap_cb(self, msg):
+        """ekf_global's IMU-dropout state (Float64MultiArray [stamp, state, s since the last trusted gyro, r]; Fix 2)."""
+        if len(msg.data) > 2:
+            prev, self.imu_gap_state = self.imu_gap_state, int(round(msg.data[1]))
+            self.imu_gap_len = float(msg.data[2])
+            if prev == 0 and self.imu_gap_state != 0:         # a new dropout
+                self.gap_need_fix, self.gap_moved = True, False
+            elif self.imu_gap_state == 0 and not self.gap_moved:
+                self.gap_need_fix = False                       # parked all along: nothing can have drifted
 
     def reset_cb(self, _msg):
         self.reset_pending = True
@@ -319,19 +350,30 @@ class StateEstimateNode(Node):
         if slipping:
             flags |= SE.FLAG_WHEEL_SLIP
             self.flag_msgs['slip'] += 1
+        if self.imu_gap_state != 0 and moving:
+            self.gap_moved = True
+        use_gap = bool(p('use_imu_gap'))
+        gap = use_gap and self.imu_gap_state != 0           # GAP or RECOVERING (Fix 2)
+        gap_lost = gap and self.imu_gap_len > p('imu_gap_lost_s')
+        gap_degraded = gap or (use_gap and self.gap_need_fix)
+        if gap:
+            flags |= SE.FLAG_IMU_STALE
+            self.flag_msgs['gap'] += 1
 
         # mode
         if self.mode == SE.MODE_INIT and (self.last_fix_t is None or std_xy > p('std_ok_m')):
             mode = SE.MODE_INIT                # stays INIT until the first good fix
         elif std_xy > p('std_lost_m') or (lidar_stale and fix_age is not None
-                                          and fix_age > p('lidar_lost_s')):
+                                          and fix_age > p('lidar_lost_s')) or gap_lost:
             mode = SE.MODE_LOST
-        elif std_xy > p('std_ok_m') or lidar_stale or mismatch or lagging or slipping:
+        elif std_xy > p('std_ok_m') or lidar_stale or mismatch or lagging or slipping or gap_degraded:
             mode = SE.MODE_DEGRADED
         else:
             mode = SE.MODE_OK
         if mode != self.mode:
-            extra = (', MAP MISMATCH' if mismatch else '') + (f', ESTIMATOR LAG {age_ms:.0f} ms' if lagging else '')
+            extra = (', MAP MISMATCH' if mismatch else '') + (f', ESTIMATOR LAG {age_ms:.0f} ms' if lagging else '') + (
+                f', IMU DROPOUT {1000 * self.imu_gap_len:.0f} ms' if gap else (', after IMU dropout: waiting for a fix'
+                                                                             if gap_degraded else ''))
             self.get_logger().info(f'mode {self.mode} -> {mode} (std_xy {std_xy*100:.1f} cm, '
                                    f'driven since fix {fix_age if fix_age is None else round(fix_age, 2)} s{extra})')
         self.mode = mode
@@ -391,11 +433,12 @@ class StateEstimateNode(Node):
             f'node work mean {proc.mean():.0f} us | modes: {modes} | lap {self.track.lap}'
             f" | v0.3: map checks {self.map_checks}{'' if self.get_parameter('use_map_check').value else ' (ignored)'}, "
             f"MAP MISMATCH msgs {self.flag_msgs['map']}, LAG msgs {self.flag_msgs['lag']}, "
-            f"WHEEL SLIP msgs {self.flag_msgs['slip']}{'' if self.get_parameter('use_slip_check').value else ' (ignored)'} "
+            f"WHEEL SLIP msgs {self.flag_msgs['slip']}{'' if self.get_parameter('use_slip_check').value else ' (ignored)'}, "
+            f"IMU DROPOUT msgs {self.flag_msgs['gap']} "
             f'(lag episodes so far {self.lag_mon.episodes})'
             + (f' | clock steps so far: {self.clock_steps}' if self.clock_steps else ''))
         self.lat_us, self.proc_us, self.mode_count = [], [], [0, 0, 0, 0]
-        self.map_checks, self.flag_msgs = 0, {'map': 0, 'lag': 0, 'slip': 0}
+        self.map_checks, self.flag_msgs = 0, {'map': 0, 'lag': 0, 'slip': 0, 'gap': 0}
 
 
 def main():

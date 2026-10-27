@@ -259,6 +259,31 @@ UPDATE 3 -- WHEEL-SLIP CHECK (both modes, 2026-10-26, Fix 3; slip_check.py)
     REAL CAR: measure slip_lag_s (wheel vs IMU step test), mount the IMU near the centre (or correct the lever
     arm), refit slip_r0 above the normal tyre slip of hard acceleration; start with slip_use_observer false.
 
+UPDATE 4 -- IMU DROPOUT: predict from wheel + steering (both modes, 2026-10-27, Fix 2; imu_gap.py)
+    Why: the EKF predicted only when an IMU sample arrived -> during a dropout the estimate stood still, and a gap
+    > 0.5 s was skipped completely when the IMU came back (fault F04, 1 s at 6 m/s: ~6 m lost in both EKFs, AMCL lost
+    too, never recovered). Control chose Option A (26 Oct): keep publishing during a dropout, DEGRADED + FLAG_IMU_STALE,
+    LOST after 50 ms (provisional), no automatic recovery -- approved for isolated development and synthetic
+    evaluation; the wheel-based stamp needs a contract amendment before operational use.
+    imu_gap_predict false (THE NODE DEFAULT) = the old behaviour exactly. The simulator launch files set it true.
+    What (imu_gap.ImuGap): at every wheel sample, no IMU sample for > imu_gap_s (25 ms) = DROPOUT -- by the stamps AND
+    by the receive times (this node's clock when the callbacks run): the wheel message must be fresh and no IMU message
+    handled for > imu_gap_s, else it is a processing backlog / stall, not a dropout (job 207: the stamps alone gave
+    false dropouts at start-up, 2 of 10 runs). Then each wheel
+    sample predicts to its own stamp: speed k*v_meas, yaw rate r = v tan(steer)/(L + imu_gap_kus v^2) + (last gyro -
+    model at the gap start) * exp(-t/imu_gap_tau_b), yaw-rate noise imu_gap_sigma_w per step (0.4 rad/s: 97-100 % of the
+    offline errors inside 2 sigma); /odom/ekf is published at the WHEEL rate with the wheel sample's stamp.
+    The time step is now measured from the state's own time (t_state), so the first IMU sample after a gap continues
+    from the last wheel prediction -- nothing is skipped.
+    Recovery: the returning gyro is NOT trusted until imu_gap_rec_n samples in a row agree with the wheel model within
+    imu_gap_rec_tol (control: no automatic clear); until then the model's yaw rate is used, no ZUPT, the slip check and
+    the wheel-delay compensation get no IMU data. <prefix>/imu_gap + gap_hooks -> state_estimate (FLAG_IMU_STALE,
+    LOST after imu_gap_lost_s without a trusted gyro, DEGRADED until a fresh AMCL fix after the recovery).
+    Offline (gap_eval.py, validation, p95 heading / lateral at the end of the gap): 0.2 s 1.7 deg / 1.1 cm,
+    0.5 s 4.0 deg / 4.8 cm, 1 s 6.5 deg / 17 cm (the old code: 4.5 deg / 6.5 cm, 23 deg / 44 cm, 68 deg / 1.9 m + 4.5 m).
+    REAL CAR: imu_gap_s from the IMU's real sample spacing (~2.5 periods), imu_gap_kus fitted on real laps, steering =
+    the commanded angle (servo lag); keep imu_gap_predict false until control has accepted the stamp amendment.
+
 Topics
   in : /imu/data (gyro z; + accel x/y with wheel_delay_s >= 0 or slip_check), /vehicle/measured,
        /amcl_pose (global), /initialpose (global)
@@ -276,6 +301,9 @@ Topics
        <diag_prefix>/slip (slip_check; std_msgs/Float64MultiArray, one per decided wheel sample:
            [wheel stamp s, slip 0/1, wheel speed k*v m/s, observer speed m/s, residual m/s, threshold m/s,
             accelerometer bias m/s^2, gated samples so far]) ;
+       <diag_prefix>/imu_gap (imu_gap_predict; std_msgs/Float64MultiArray, with every odometry while the gyro is not
+           trusted and once when it is again: [stamp s, state 0 OK / 1 GAP / 2 RECOVERING, s since the last trusted
+           gyro, yaw rate used rad/s]) ;
        TF odom -> est/base_link (local only)
 
 CPU (2026-10-03): in Python ROS 2 the cost is mostly MESSAGES, not math. The sim
@@ -318,7 +346,7 @@ class LocalizationEKF:
 
     # --- prediction ----------------------------------------------------------
 
-    def predict(self, v_meas, w_meas, beta, dt, use_k=True, sigma_v=None):
+    def predict(self, v_meas, w_meas, beta, dt, use_k=True, sigma_v=None, sigma_w=None):
         """use_k False (wheel slip, docstring UPDATE 3): v_meas is already a TRUE speed (the IMU observer), the
         wheel scale k takes no part (no k in the motion, no k column in F). sigma_v: speed noise override."""
         px, py, yaw, b, k = self.x
@@ -344,7 +372,8 @@ class LocalizationEKF:
         G[1, 0] = k * s * dt
         G[2, 1] = dt
         sv = self.sigma_v if sigma_v is None else sigma_v
-        Qu = np.diag([sv ** 2, self.sigma_w ** 2])
+        sw = self.sigma_w if sigma_w is None else sigma_w     # yaw-rate noise override (IMU dropout, UPDATE 4)
+        Qu = np.diag([sv ** 2, sw ** 2])
         self.P = F @ self.P @ F.T + G @ Qu @ G.T
         self.P[self.B, self.B] += self.sigma_bw ** 2 * dt
         self.P[self.K, self.K] += self.sigma_kw ** 2 * dt
@@ -654,6 +683,7 @@ try:
     from state_estimation.map_check import (BAD_ALONG, BAD_FIT, CpuBudget, DistanceField, MismatchAlarm, make_shifts,
                                             shift_search)
     from state_estimation.slip_check import SimGate, SlipCheck
+    from state_estimation.imu_gap import GAP as IMU_GAP, ImuGap, STATE_NAMES as GAP_NAMES
     from state_estimation.vehicle_model import sideslip_from_params
     from state_estimation.wheel_delay import WheelSpeedCompensator
 except ImportError:
@@ -785,6 +815,15 @@ class EkfNode(Node):
         d('slip_imu_gap_s', 0.05)           # s: IMU gap -> re-sync to the wheel
         d('slip_ki_bias', 0.3)              # 1/s^2: accelerometer-bias learning while driving (0 = standstill only)
         d('sim_wheel_ideal_topic', '')      # SIMULATOR ONLY: /sim/wheel_ideal (artifact gate); '' on the real car
+        # IMU dropout (2026-10-27, Fix 2, docstring UPDATE 4, imu_gap.py). Default OFF = the old behaviour; the simulator
+        # launch files switch it on (control: Option A for development + synthetic evaluation; stamp amendment pending)
+        d('imu_gap_predict', False)         # predict from wheel + steering while the IMU is silent
+        d('imu_gap_s', 0.025)               # s without an IMU sample = dropout (2.5 periods at 100 Hz)
+        d('imu_gap_kus', 0.0)               # s^2/m understeer of the yaw-rate model (simulator fit ~0)
+        d('imu_gap_tau_b', 0.2)             # s: the last gyro's offset to the model fades with this
+        d('imu_gap_sigma_w', 0.4)           # rad/s: yaw-rate noise per prediction step during the dropout
+        d('imu_gap_rec_n', 10)              # returning gyro trusted after this many samples in a row ...
+        d('imu_gap_rec_tol', 0.5)           # rad/s ... that agree with the wheel model within this
         # Steering calibration (steer_calib); 'none' = use the measured steering as it is
         d('steer_calib_file', '~/.ros/steering_calibration.yaml')
         # Speed-scale calibration file (see docstring)
@@ -829,6 +868,7 @@ class EkfNode(Node):
         self.v = 0.0
         self.v_used = 0.0                   # the speed the EKF predicts with (v + delay compensation)
         self.speed_used = 0.0               # ... in TRUE m/s (k * v_used, or the IMU speed while slipping)
+        self.t_state = None                 # time the state is valid at (IMU samples; wheel samples in a dropout)
         self.steer = 0.0
         self.stopped_since = None
         self.last_imu_t = None
@@ -848,6 +888,15 @@ class EkfNode(Node):
                                   min_on=p('slip_min_on_s'), max_on=p('slip_max_on_s'), gap=p('slip_imu_gap_s'),
                                   sim_gate=self.slip_gate, ki_bias=p('slip_ki_bias'),
                                   r_off_rate=p('slip_r_off_rate'))
+        # IMU dropout (docstring UPDATE 4)
+        self.gap = None
+        self.gap_hooks = []                 # state_pipeline: ekf_global -> state_estimate.imu_gap_cb
+        self.gap_sigma_w = float(p('imu_gap_sigma_w'))
+        self.gap_predictions = 0
+        self.gap_last_pub = 0
+        if p('imu_gap_predict'):
+            self.gap = ImuGap(gap_s=p('imu_gap_s'), wheelbase=p('lf') + p('lr'), kus=p('imu_gap_kus'),
+                              tau_b=p('imu_gap_tau_b'), rec_n=p('imu_gap_rec_n'), rec_tol=p('imu_gap_rec_tol'))
         self.distance = 0.0
         self.truth = None
         self.truth_hist = deque(maxlen=400)
@@ -916,6 +965,17 @@ class EkfNode(Node):
                        if self.map_check_on else None)
         self.slip_pub = (self.create_publisher(Float64MultiArray, pre + '/slip', 10)
                          if self.slip is not None else None)
+        self.gap_pub = (self.create_publisher(Float64MultiArray, pre + '/imu_gap', 10)
+                        if self.gap is not None else None)
+        if self.gap is not None:
+            self.get_logger().info(
+                f"IMU dropout prediction ON -> {pre}/imu_gap: no IMU for > {1000 * p('imu_gap_s'):.0f} ms -> predict at "
+                f"every wheel sample (yaw rate v tan(steer) / (L + {p('imu_gap_kus'):g} v^2) + fading last-gyro offset, "
+                f"tau {p('imu_gap_tau_b'):g} s, sigma {self.gap_sigma_w:g} rad/s); returning gyro trusted after "
+                f"{p('imu_gap_rec_n')} samples within {p('imu_gap_rec_tol'):g} rad/s of the model")
+        else:
+            self.get_logger().info('IMU dropout prediction OFF (imu_gap_predict false): the estimate stands still '
+                                   'while the IMU is silent (the old behaviour)')
         if self.slip_gate is not None:      # SIMULATOR ONLY (docstring UPDATE 3)
             self.create_subscription(TwistStamped, ideal_topic, self.wheel_ideal_cb, 50)
         if self.slip is not None:
@@ -1054,6 +1114,48 @@ class EkfNode(Node):
                 self.stopped_since = now
         else:
             self.stopped_since = None
+        if self.gap is not None:            # IMU dropout: predict at the wheel rate (docstring UPDATE 4)
+            st = self.gap.wheel(now.nanoseconds * 1e-9, float(self.ekf.x[4]) * self.v, self.steer,
+                                rx=self.get_clock().now().nanoseconds * 1e-9)
+            self.log_gap()
+            if st == IMU_GAP and self.t_state is not None:
+                self.gap_predict(now, msg.header.stamp)
+
+    def gap_predict(self, now, stamp):
+        """One prediction to the wheel sample's stamp from wheel speed + steering (IMU silent, docstring UPDATE 4)."""
+        dt = (now - self.t_state).nanoseconds * 1e-9
+        if dt <= 0.0:
+            return
+        self.t_state = now
+        if dt > 0.5:                        # wheel AND IMU silent for > 0.5 s: nothing to predict with
+            return
+        b, k = float(self.ekf.x[3]), float(self.ekf.x[4])
+        r = self.gap.yaw_rate(now.nanoseconds * 1e-9)
+        self.v_used = self.v
+        self.speed_used = k * self.v
+        if self.is_stopped(now):
+            self.ekf.stationary_predict(dt)
+        else:
+            beta = self.sideslip.beta(self.speed_used, r, self.steer)
+            self.ekf.predict(self.v, r + b, beta, dt, sigma_w=self.gap_sigma_w)
+            self.distance += abs(self.speed_used) * dt
+        self.gap_predictions += 1
+        self.history.add(now.nanoseconds, self.ekf.x)
+        self.publish_odom(stamp, r + b)
+
+    def log_gap(self):
+        """One log line per dropout event (docstring UPDATE 4)."""
+        lg = self.get_logger()
+        for kind, t_s, a, g_s in self.gap.pop_events():
+            if kind == 'gap':
+                lg.warn(f'IMU DROPOUT: no trusted IMU sample for {1000 * (t_s - a):.0f} ms -> predicting from wheel + '
+                        f'steering (yaw rate {self.gap.yaw_rate(t_s):+.2f} rad/s, last gyro {self.gap.r_trusted:+.2f})')
+            elif kind == 'back':
+                lg.info(f'IMU back after {a:.3f} s -> checking the gyro against the wheel model before trusting it')
+            elif kind == 'valid':
+                lg.info(f'IMU trusted again: {1000 * a:.0f} ms of consistent gyro ({g_s:.3f} s without a trusted gyro)')
+            else:
+                lg.warn(f'returning gyro disagrees with the wheel model by {a:+.2f} rad/s -> not trusted yet')
 
     def is_stopped(self, now):
         if self.stopped_since is None:
@@ -1065,37 +1167,52 @@ class EkfNode(Node):
         t = Time.from_msg(msg.header.stamp)
         if self.last_imu_t is None:
             self.last_imu_t = t
+            self.t_state = t
             return
-        dt = (t - self.last_imu_t).nanoseconds * 1e-9
+        # the step starts at the state's time: after an IMU dropout that is the last WHEEL prediction (UPDATE 4)
+        dt = (t - (self.t_state if self.gap is not None else self.last_imu_t)).nanoseconds * 1e-9
         self.last_imu_t = t
-        if dt <= 0.0 or dt > 0.5:
-            return
         w_m = msg.angular_velocity.z
+        trusted = True
+        if self.gap is not None:            # a returning gyro is trusted only after the check (docstring UPDATE 4)
+            trusted = self.gap.imu(t.nanoseconds * 1e-9, w_m - float(self.ekf.x[3]),
+                                   rx=self.get_clock().now().nanoseconds * 1e-9)
+            self.log_gap()
+        if dt <= 0.0 or dt > 0.5:
+            if dt > 0.5:
+                self.t_state = t
+            return
+        self.t_state = t
+        if not trusted:                     # RECOVERING: predict with the wheel model, not the returning gyro
+            w_m = self.gap.yaw_rate(t.nanoseconds * 1e-9) + float(self.ekf.x[3])
         a = msg.linear_acceleration
         slipping = False
-        if self.slip is not None:           # docstring UPDATE 3
+        if self.slip is not None and trusted:   # docstring UPDATE 3 (no IMU data for it while untrusted)
             self.slip.imu(t.nanoseconds * 1e-9, self.imu_c * a.x - self.imu_s * a.y)
             self.log_slip()
             slipping = self.slip.on
         stopped = self.is_stopped(t) and not slipping     # locked wheels while slipping: NOT parked
         self.v_used = self.v
-        if self.wheel_comp is not None:     # speed gained since the wheel value was true (true m/s)
+        if self.wheel_comp is not None and trusted:     # speed gained since the wheel value was true (true m/s)
             a = msg.linear_acceleration
             dv = self.wheel_comp.on_imu(t.nanoseconds * 1e-9, self.imu_c * a.x - self.imu_s * a.y, dt, stopped)
             self.v_used = self.v + dv / max(float(self.ekf.x[4]), 0.5)      # raw units, as v
         use_obs = slipping and self.slip_use
         self.speed_used = self.slip.observer_speed if use_obs else float(self.ekf.x[4]) * self.v_used
 
-        if stopped:                         # ZUPT, or a turn while standing (docstring UPDATE 1)
+        sw = None if trusted else self.gap_sigma_w
+        if stopped and not trusted:         # no ZUPT from an untrusted gyro (docstring UPDATE 4)
+            self.ekf.stationary_predict(dt)
+        elif stopped:                       # ZUPT, or a turn while standing (docstring UPDATE 1)
             self.log_standstill(self.still.step(self.ekf, w_m, dt))
         else:
             self.log_standstill(self.still.moving())
             # sideslip (vehicle_model): 'steer' = kinematic from the steering, 'slip' = gyro + tyre slip
             beta = self.sideslip.beta(self.speed_used, w_m - self.ekf.x[3], self.steer)
             if use_obs:                     # wheel slip: the IMU speed, true m/s, no wheel scale (UPDATE 3)
-                self.ekf.predict(self.speed_used, w_m, beta, dt, use_k=False, sigma_v=self.slip_sigma_v)
+                self.ekf.predict(self.speed_used, w_m, beta, dt, use_k=False, sigma_v=self.slip_sigma_v, sigma_w=sw)
             else:
-                self.ekf.predict(self.v_used, w_m, beta, dt)
+                self.ekf.predict(self.v_used, w_m, beta, dt, sigma_w=sw)
             self.distance += abs(self.speed_used) * dt
 
         if self.fault is not None:                  # TEST ONLY (test_fault)
@@ -1405,6 +1522,14 @@ class EkfNode(Node):
         odom.pose.covariance = [float(c) for c in cov]
         odom.twist.twist.linear.x = self.speed_used          # k * v_used (delay comp.), or the IMU speed while slipping
         odom.twist.twist.angular.z = float(w_m) - b
+        if self.gap is not None and (self.gap.state != 0 or self.gap_last_pub != 0):   # UPDATE 4, BEFORE the odometry
+            t_s = Time.from_msg(stamp).nanoseconds * 1e-9
+            gm = Float64MultiArray()
+            gm.data = [t_s, float(self.gap.state), self.gap.gap_len(t_s), float(w_m) - b]
+            self.gap_pub.publish(gm)
+            for hook in self.gap_hooks:
+                hook(gm)
+            self.gap_last_pub = self.gap.state
         self.odom_pub.publish(odom)
         for hook in self.odom_hooks:
             hook(odom)
@@ -1477,6 +1602,11 @@ class EkfNode(Node):
             line += (f' | slip episodes {sl.episodes}, on {sl.on_s:.1f} s, accel bias {sl.bias:+.3f}'
                      + (f', sim-gated {sl.gated_n}' if self.slip_gate is not None else '')
                      + (' (SLIP ON)' if sl.on else ''))
+        if self.gap is not None:
+            g = self.gap
+            line += (f' | IMU dropouts {g.episodes}' + (f', longest {g.longest:.2f} s, wheel predictions '
+                     f'{self.gap_predictions}, gyro rejects {g.rejects}' if g.episodes else '')
+                     + (f' ({GAP_NAMES[g.state]})' if g.state else ''))
         st = self.still
         line += f' | ZUPTs {st.zupts}' + (f' | turned while standing: {st.turn_samples} samples' if st.turn_samples
                                           else '') + (f', bias changes {st.bias_changes}' if st.bias_changes else '')
