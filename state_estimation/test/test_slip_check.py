@@ -127,6 +127,73 @@ def test_locked_wheels_skid():
     assert abs(sc.bias - 0.08) < 0.03, f'bias {sc.bias:.3f}: the braking was learned as bias'
 
 
+def late_wheel_stream(stale_s=0.09, bias=0.08, seed=3):
+    """Job 208 G2 (2026-10-27): the estimator got NO wheel messages for the first seconds (its subscription connected
+    late) while the IMU ran normally; the first wheel messages then arrived in a burst, ~90 ms stale, just as the car
+    launched at 9.5 m/s^2. Events are handled in RECEIVE order. Returns (SlipCheck, rows (t, on, v_obs, v_true))."""
+    rnd = random.Random(seed)
+    prof = lambda t: 0.0 if t < 2.6 else min(6.0, 9.5 * (t - 2.6))      # noqa: E731
+    ev, a_lp, v_prev = [], 0.0, 0.0
+    for i in range(1, 5001):                                             # 1 ms truth steps, 5 s
+        t = i * 0.001
+        v = prof(t)
+        a_lp += 0.001 / 0.040 * ((v - v_prev) / 0.001 - a_lp)
+        v_prev = v
+        if i % 10 == 0:
+            ev.append((t + 0.002, 'imu', t, a_lp + bias + rnd.gauss(0.0, 0.05)))
+        if i % 20 == 5:
+            vt = prof(t - 0.010)
+            vw = vt + (rnd.gauss(0.0, 0.03) if vt > 1e-3 else 0.0)
+            t_first = 2.6 + stale_s
+            if t < 2.6:
+                continue                                                 # never delivered (not connected yet)
+            rx = t_first + (t - 2.6) * 0.01 + 0.002 if t < t_first else t + 0.002   # burst, then normal
+            ev.append((rx, 'wheel', t, vw))
+    sc, rows = SlipCheck(), []
+    for rx, kind, t, val in sorted(ev):
+        if kind == 'imu':
+            sc.imu(t, val)
+        else:
+            sc.wheel(t, val)
+            rows.append((t, sc.on, sc.observer_speed, prof(t)))
+    return sc, rows
+
+
+def test_wheel_stream_starts_late():
+    """The observer must not start from a STALE wheel sample (job 208: started 0.87 m/s low -> a false 3 s 'slip'
+    at launch and the estimate was lost). It waits for a current one: no false slip, observer right."""
+    sc, rows = late_wheel_stream()
+    assert sc.episodes == 0, f'{sc.episodes} false slip episodes at launch'
+    late = [r for r in rows if r[0] > 3.5]          # after the 9.5 m/s^2 launch (ends 3.23 s); during it the observer
+    assert max(abs(r[2] - r[3]) for r in late) < 0.1, 'observer speed off after the late start'   # lags ~a * 0.05 s
+
+
+def test_wheel_gap_while_driving_resyncs():
+    """The wheel stream stops for 0.5 s while driving and comes back with a stale burst: re-sync, no false slip."""
+    rnd = random.Random(5)
+    sc = SlipCheck()
+    prof = lambda t: min(5.0, 4.0 * max(0.0, t - 1.0))                   # noqa: E731
+    ev, a_lp, v_prev = [], 0.0, 0.0
+    for i in range(1, 6001):
+        t = i * 0.001
+        v = prof(t)
+        a_lp += 0.001 / 0.040 * ((v - v_prev) / 0.001 - a_lp)
+        v_prev = v
+        if i % 10 == 0:
+            ev.append((t + 0.002, 'imu', t, a_lp + 0.08 + rnd.gauss(0.0, 0.05)))
+        if i % 20 == 5:
+            vt = prof(t - 0.010)
+            vw = vt + (rnd.gauss(0.0, 0.03) if vt > 1e-3 else 0.0)
+            if 1.5 <= t < 2.0:
+                rx = 2.09 + (t - 1.5) * 0.01                              # held back, then a burst 90 ms late
+            else:
+                rx = t + 0.002
+            ev.append((rx, 'wheel', t, vw))
+    for rx, kind, t, val in sorted(ev):
+        sc.imu(t, val) if kind == 'imu' else sc.wheel(t, val)
+    assert sc.episodes == 0, f'{sc.episodes} false slip episodes after a wheel gap'
+
+
 def test_spin_while_accelerating():
     """Wheelspin in the middle of a 3 m/s^2 acceleration (the c_a * |a| margin must not hide it)."""
     sc, rows = drive(6.0, prof=lambda t: profile(t, cruise=9.0), fault=(2.0, 2.6, 1.15))

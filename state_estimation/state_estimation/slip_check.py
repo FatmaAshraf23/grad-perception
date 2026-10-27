@@ -38,7 +38,11 @@ HOW (SlipCheck)
        Without the two additions (ki_bias 0, r_off_rate 0 = the prototype): a bias change of 0.1 m/s^2
        while driving left every F05/F06 flag stuck on until max_on and gave false alarms (table below).
     5. IMU GAP: no IMU sample for > gap (50 ms) -> the observer has nothing to integrate: re-sync to the
-       wheel, OFF. Known limit: a slip that is already on when the IMU drops out is forgotten (the
+       wheel, OFF.
+    6. START (2026-10-27, job 208): the observer starts from the first wheel sample whose stamp is within sync_tol
+       (50 ms) of the newest IMU sample. In one simulator run the estimator got no wheel messages for the first
+       ~3 s (the subscription connected late) and the first ones then arrived ~90 ms stale just as the car launched
+       at 9.5 m/s^2: the observer started 0.87 m/s too low -> a false 3 s 'slip' -> the estimate was lost. Known limit: a slip that is already on when the IMU drops out is forgotten (the
        observer then starts again from the slipping wheel speed). That is Fix 2's territory (IMU gap).
 
 KNOWN LIMITS
@@ -128,13 +132,14 @@ class SlipCheck:
 
     def __init__(self, lag=0.03, tau=0.5, r0=0.20, c_a=0.03, r_off=0.10, k_on=2, k_off=5,
                  min_on=0.2, max_on=3.0, gap=0.05, stop_speed=0.01, stop_s=0.3, sim_gate=None,
-                 ki_bias=0.3, r_off_rate=0.05, b_max=0.5):
+                 ki_bias=0.3, r_off_rate=0.05, b_max=0.5, sync_tol=0.05):
         if not r_off < r0:
             raise ValueError('SlipCheck needs r_off < r0 (hysteresis gap)')
         self.lag, self.tau, self.r0, self.c_a, self.r_off = float(lag), float(tau), float(r0), float(c_a), float(r_off)
         self.ki_bias = float(ki_bias)          # bias learning WHILE DRIVING from the residual [1/s^2] (0 = off)
         self.r_off_rate = float(r_off_rate)    # OFF threshold grows by this per s of slip [m/s/s] (0 = off)
         self.b_max = float(b_max)
+        self.sync_tol = float(sync_tol)        # start the observer only from a wheel sample this close to the IMU time
         self.k_on, self.k_off = int(k_on), int(k_off)
         self.min_on, self.max_on, self.gap = float(min_on), float(max_on), float(gap)
         self.stop_speed, self.stop_s = float(stop_speed), float(stop_s)
@@ -163,6 +168,7 @@ class SlipCheck:
         self.gated_n = 0
         self.decided_n = 0
         self.resyncs = 0
+        self.sync_waits = 0                    # stale wheel samples skipped while waiting for a current one
 
     # --- outputs ---------------------------------------------------------------------------------------
 
@@ -219,6 +225,9 @@ class SlipCheck:
         t, v = float(t), float(v)
         self.vw = v
         if not self.synced:                            # first wheel sample (node started while moving?):
+            if self.t_imu is not None and abs(t - self.t_imu) > self.sync_tol:
+                self.sync_waits += 1                   # STALE (or the IMU far behind): wait for a CURRENT sample --
+                return []                              # job 208: started from a 90 ms old one, 0.87 m/s low at launch
             self.v = v                                 # start the observer at the wheel speed, not at 0
             self.hist.clear()
             self.pend.clear()
