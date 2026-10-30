@@ -44,6 +44,12 @@ HOW (SlipCheck)
        ~3 s (the subscription connected late) and the first ones then arrived ~90 ms stale just as the car launched
        at 9.5 m/s^2: the observer started 0.87 m/s too low -> a false 3 s 'slip' -> the estimate was lost. Known limit: a slip that is already on when the IMU drops out is forgotten (the
        observer then starts again from the slipping wheel speed). That is Fix 2's territory (IMU gap).
+    7. WHEEL DATA LOST (2026-10-30, Fix 4, wheel_gap.py): wheel_lost(t) when /vehicle/measured goes silent. The
+       observer then runs on the IMU alone and is the speed the EKF predicts with: its "parked" memory is cleared
+       (stale wheel data must not mean parked -- otherwise it would also stay at 0 when the car sets off), no bias
+       learning (stopped is never true), a slip in progress ends ('wheel data lost'), an IMU gap no longer re-syncs
+       to the stale wheel speed. The next wheel sample re-syncs the observer to the wheel like a start (sync_tol):
+       no decision on it -- job 221 showed a false WHEEL SLIP right after the data came back.
 
 KNOWN LIMITS
     - a wheel error below r0 (0.20 m/s, e.g. 5 % at 4 m/s) is not detected; the pull absorbs it.
@@ -169,6 +175,8 @@ class SlipCheck:
         self.decided_n = 0
         self.resyncs = 0
         self.sync_waits = 0                    # stale wheel samples skipped while waiting for a current one
+        self.lost = False                      # wheel data lost (wheel_lost, Fix 4): IMU-only until the next sample
+        self.lost_n = 0
 
     # --- outputs ---------------------------------------------------------------------------------------
 
@@ -201,8 +209,9 @@ class SlipCheck:
             # a wheel at 0 WHILE SLIPPING is a locked wheel (hard braking), not a parked car: the car may
             # still slide at several m/s -- no v = 0, no bias learning from the braking deceleration
             stopped = (not self._on and self.stop_since is not None and t - self.stop_since >= self.stop_s)
-            if dt > self.gap or dt <= 0.0:             # IMU gap (or time went back): re-sync to the wheel
-                self.v = self.vw
+            if dt > self.gap or dt <= 0.0:             # IMU gap (or time went back): re-sync to the wheel ...
+                if not self.lost:                       # ... unless the wheel data is lost too (stale, Fix 4)
+                    self.v = self.vw
                 self.hist.clear()
                 self.pend.clear()
                 self.n_on = 0
@@ -218,11 +227,26 @@ class SlipCheck:
         self.t_imu = t
         self.hist.append((t, self.v))
 
+    def wheel_lost(self, t):
+        """The wheel data stopped (docstring 7): IMU-only observer, not parked, no bias learning, no slip decision."""
+        if self.lost:
+            return
+        self.lost = True
+        self.lost_n += 1
+        self.stop_since = None
+        self.pend.clear()
+        self.n_on = 0
+        if self._on:
+            self._set(False, float(t), 'wheel data lost', 0.0)
+
     def wheel(self, t, v, gated=False):
         """One wheel sample: time [s], speed in TRUE m/s (k * v_raw). gated=True: a known simulator artifact
         (also checked with sim_gate at decision time). Decides every queued sample the IMU has passed by
         `lag`; returns their (t, z, v_obs, r, thr, on) rows (diagnostics, may be empty)."""
         t, v = float(t), float(v)
+        if self.lost:                                  # first sample after a dropout: re-sync like a start
+            self.lost = False
+            self.synced = False
         self.vw = v
         if not self.synced:                            # first wheel sample (node started while moving?):
             if self.t_imu is not None and abs(t - self.t_imu) > self.sync_tol:

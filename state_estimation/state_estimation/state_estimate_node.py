@@ -79,6 +79,15 @@ HEALTH CHECKS NEW IN CONTRACT v0.3 (2026-10-24; offline evidence: control_data/v
         MOVED during the dropout. A parked car cannot drift (and AMCL does not update while it stands), so then the
         recovery is enough (job 207: otherwise a dropout on the start line blocked OK until the car drove).
         use_imu_gap false = ignore it.
+    WHEEL DATA LOST (Fix 4, 2026-10-30; LOST limit = a proposal to control): FLAG_WHEEL_STALE (4) has always been set
+        when no /vehicle/measured arrived for wheel_stale_s (50 ms) -- but it never changed the mode, so a dead wheel
+        link gave mode OK while the EKFs drove on with a frozen speed (fault F11, job 221: up to 52 m off, OK for
+        2.2 s). Now (use_wheel_stale true): FLAG_WHEEL_STALE -> at least DEGRADED; no wheel data for wheel_lost_s
+        (1.0 s) -> LOST. Measured on this node's own clock (not ekf_global's), so it also works with ekf_node
+        wheel_gap_predict false. Meanwhile the EKFs predict with the IMU speed and their std_xy grows honestly
+        (ekf_node UPDATE 5); after the data is back the std thresholds (std_ok_m) keep the mode DEGRADED until AMCL
+        fixes have shrunk it. Clean runs (18 recorded, incl. the CPU-lag fault F07): FLAG_WHEEL_STALE never set.
+        use_wheel_stale false = the old behaviour (flag only).
     valid_for_ms 50 (v0.2: 30): control's age limit, as control proposed (2026-10-21); provisional
         until measured on the Pi.
     schema_version 'apex-state-estimate/1.1': same fields, two new flag bits (minor version).
@@ -144,6 +153,8 @@ class StateEstimateNode(Node):
         d('moving_speed', 0.1)                 # m/s; below = standing still
         d('imu_stale_s', 0.025)                # sim IMU 100 Hz (real car 200 Hz -> 0.010)
         d('wheel_stale_s', 0.05)               # sim wheel 50 Hz (real car -> 0.030)
+        d('use_wheel_stale', True)             # FLAG_WHEEL_STALE -> DEGRADED, LOST after wheel_lost_s (Fix 4)
+        d('wheel_lost_s', 1.0)                 # s without wheel data -> LOST (proposal to control, Fix 4)
         d('correction_step_m', 0.05)
         d('near_singular', 0.3)                # flag when 1 - kappa*e_y < this
         # contract v0.3 health checks (docstring HEALTH CHECKS)
@@ -204,7 +215,7 @@ class StateEstimateNode(Node):
         self.imu_gap_len = 0.0                 # s since its last trusted gyro sample
         self.gap_need_fix = False              # after a dropout: OK only after a fresh accepted AMCL fix ...
         self.gap_moved = False                 # ... if the car moved during the dropout / recovery
-        self.flag_msgs = {'map': 0, 'lag': 0, 'slip': 0, 'gap': 0}  # messages published with the flag since the last report
+        self.flag_msgs = {'map': 0, 'lag': 0, 'slip': 0, 'gap': 0, 'wheel': 0}  # msgs with the flag since the last report
 
         self.pub = self.create_publisher(SE, '/state_estimate', 10)
         if own_inputs:
@@ -320,8 +331,14 @@ class StateEstimateNode(Node):
             flags |= SE.FLAG_LIDAR_STALE
         if self.last_imu_t is not None and now - self.last_imu_t > p('imu_stale_s'):
             flags |= SE.FLAG_IMU_STALE
-        if self.last_wheel_t is None or now - self.last_wheel_t > p('wheel_stale_s'):
+        wheel_age = math.inf if self.last_wheel_t is None else now - self.last_wheel_t
+        if wheel_age > p('wheel_stale_s'):
             flags |= SE.FLAG_WHEEL_STALE
+        use_ws = bool(p('use_wheel_stale'))
+        wheel_degraded = use_ws and wheel_age > p('wheel_stale_s')      # Fix 4 (docstring WHEEL DATA LOST)
+        wheel_lost = use_ws and wheel_age > p('wheel_lost_s')
+        if wheel_degraded:
+            self.flag_msgs['wheel'] += 1
         if self.prev is not None:
             dt = (t_valid.nanoseconds * 1e-9) - self.prev[0]
             if 0.0 < dt < 0.5:                 # position jump beyond what the motion explains
@@ -364,14 +381,17 @@ class StateEstimateNode(Node):
         if self.mode == SE.MODE_INIT and (self.last_fix_t is None or std_xy > p('std_ok_m')):
             mode = SE.MODE_INIT                # stays INIT until the first good fix
         elif std_xy > p('std_lost_m') or (lidar_stale and fix_age is not None
-                                          and fix_age > p('lidar_lost_s')) or gap_lost:
+                                          and fix_age > p('lidar_lost_s')) or gap_lost or wheel_lost:
             mode = SE.MODE_LOST
-        elif std_xy > p('std_ok_m') or lidar_stale or mismatch or lagging or slipping or gap_degraded:
+        elif (std_xy > p('std_ok_m') or lidar_stale or mismatch or lagging or slipping or gap_degraded
+              or wheel_degraded):
             mode = SE.MODE_DEGRADED
         else:
             mode = SE.MODE_OK
         if mode != self.mode:
             extra = (', MAP MISMATCH' if mismatch else '') + (f', ESTIMATOR LAG {age_ms:.0f} ms' if lagging else '') + (
+                f', NO WHEEL DATA {1000 * wheel_age:.0f} ms' if wheel_degraded and math.isfinite(wheel_age) else
+                (', NO WHEEL DATA yet' if wheel_degraded else '')) + (
                 f', IMU DROPOUT {1000 * self.imu_gap_len:.0f} ms' if gap else (', after IMU dropout: waiting for a fix'
                                                                              if gap_degraded else ''))
             self.get_logger().info(f'mode {self.mode} -> {mode} (std_xy {std_xy*100:.1f} cm, '
@@ -434,11 +454,12 @@ class StateEstimateNode(Node):
             f" | v0.3: map checks {self.map_checks}{'' if self.get_parameter('use_map_check').value else ' (ignored)'}, "
             f"MAP MISMATCH msgs {self.flag_msgs['map']}, LAG msgs {self.flag_msgs['lag']}, "
             f"WHEEL SLIP msgs {self.flag_msgs['slip']}{'' if self.get_parameter('use_slip_check').value else ' (ignored)'}, "
-            f"IMU DROPOUT msgs {self.flag_msgs['gap']} "
+            f"IMU DROPOUT msgs {self.flag_msgs['gap']}, NO WHEEL DATA msgs {self.flag_msgs['wheel']}"
+            f"{'' if self.get_parameter('use_wheel_stale').value else ' (ignored)'} "
             f'(lag episodes so far {self.lag_mon.episodes})'
             + (f' | clock steps so far: {self.clock_steps}' if self.clock_steps else ''))
         self.lat_us, self.proc_us, self.mode_count = [], [], [0, 0, 0, 0]
-        self.map_checks, self.flag_msgs = 0, {'map': 0, 'lag': 0, 'slip': 0, 'gap': 0}
+        self.map_checks, self.flag_msgs = 0, {'map': 0, 'lag': 0, 'slip': 0, 'gap': 0, 'wheel': 0}
 
 
 def main():

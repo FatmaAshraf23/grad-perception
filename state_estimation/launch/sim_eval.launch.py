@@ -72,6 +72,8 @@ def generate_launch_description():
                           'slip_check': LaunchConfiguration('slip_check'),
                           'slip_use_observer': LaunchConfiguration('slip_use_observer'),
                           'imu_gap_predict': LaunchConfiguration('imu_gap_predict'),
+                          'wheel_gap_predict': LaunchConfiguration('wheel_gap_predict'),
+                          'wheel_stale_mode': LaunchConfiguration('wheel_stale_mode'),
                           'initialpose_topic': LaunchConfiguration('initialpose_topic')}.items(),
     )
     driver = Node(
@@ -121,6 +123,8 @@ def generate_launch_description():
         DeclareLaunchArgument('slip_check', default_value='true'),         # wheel-slip check (Fix 3), false = off
         DeclareLaunchArgument('slip_use_observer', default_value='true'),  # false = flag only
         DeclareLaunchArgument('imu_gap_predict', default_value='true'),    # IMU dropout prediction (Fix 2), false = off
+        DeclareLaunchArgument('wheel_gap_predict', default_value='true'),  # wheel dropout: IMU speed (Fix 4), false = off
+        DeclareLaunchArgument('wheel_stale_mode', default_value='true'),   # wheel dropout -> DEGRADED / LOST (Fix 4)
         DeclareLaunchArgument('initialpose_topic', default_value='/initialpose'),  # tests: /initialpose_est
         DeclareLaunchArgument('start_delay', default_value='3.0'),         # s parked before the test driver drives
         # CPU rule (also for test_driver and eval_logger, which start here)

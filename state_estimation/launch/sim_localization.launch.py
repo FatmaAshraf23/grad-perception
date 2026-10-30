@@ -101,9 +101,12 @@ def _ekfs_and_state_estimate(context):
                            'slip_check': yes('slip_check'), 'slip_use_observer': yes('slip_use_observer'),
                            'sim_wheel_ideal_topic': '/sim/wheel_ideal',
                            # IMU dropout prediction (Fix 2): ON in the simulator only (node default false)
-                           'imu_gap_predict': yes('imu_gap_predict')})
+                           'imu_gap_predict': yes('imu_gap_predict'),
+                           # wheel-data dropout (Fix 4): the IMU speed while /vehicle/measured is silent
+                           'wheel_gap_predict': yes('wheel_gap_predict')})
     se = dict(slip, **{'steer_calib_file': arg('steer_calib_file'), 'track': arg('track'),
-                       'initialpose_topic': arg('initialpose_topic')})
+                       'initialpose_topic': arg('initialpose_topic'),
+                       'use_wheel_stale': yes('wheel_stale_mode')})
     # LOCAL EKF: odometry for AMCL, starts at the origin of the odom frame
     local = dict(common, **{
         'mode': 'odom', 'frame_id': 'odom', 'child_frame_id': 'est/base_link',
@@ -224,6 +227,10 @@ def generate_launch_description():
         DeclareLaunchArgument('slip_use_observer', default_value='true'),
         # IMU dropout prediction from wheel + steering (2026-10-27, Fix 2, ekf_node UPDATE 4): false = the old behaviour
         DeclareLaunchArgument('imu_gap_predict', default_value='true'),
+        # wheel-data dropout (2026-10-30, Fix 4, ekf_node UPDATE 5 / state_estimate WHEEL DATA LOST): false = the old
+        # behaviour (the last wheel speed, held; FLAG_WHEEL_STALE without a mode change). Node defaults: both ON.
+        DeclareLaunchArgument('wheel_gap_predict', default_value='true'),
+        DeclareLaunchArgument('wheel_stale_mode', default_value='true'),
         # AMCL along-track slide (2026-10-19, docstring): wheel-speed delay [s] for both EKFs
         # (-1 = compensation off) and AMCL's thin-wall map copy
         DeclareLaunchArgument('wheel_delay', default_value='0.010'),

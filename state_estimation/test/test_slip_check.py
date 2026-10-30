@@ -347,6 +347,123 @@ def test_needs_a_gap():
     raise AssertionError('no ValueError for r_off == r0')
 
 
+# ------------------------------------------------------------------ wheel data lost (Fix 4, 2026-10-30)
+def drive_lost(T, prof, lost, call_lost=True, bias=0.08, fault=None, imu_gap=None, seed=7, bias_step=None):
+    """Like drive(), but NO wheel samples inside lost = (t0, t1); like ekf_node, wheel_lost(t) is called at the first
+    IMU sample more than 50 ms after the last wheel sample (call_lost False = the old code). Returns (sc, rows) with
+    rows (t, v_obs, v_true) at every IMU sample, and the slip ON / OFF events."""
+    rnd = random.Random(seed)
+    sc = SlipCheck()
+    a_lp, v_prev, rows, t_w = 0.0, prof(0.0), [], None
+    h = 0.001
+    for i in range(1, int(round(T / h)) + 1):
+        t = i * h
+        v = prof(t)
+        a = (v - v_prev) / h
+        v_prev = v
+        a_lp += h / 0.040 * (a - a_lp)
+        if i % 10 == 0 and not (imu_gap and imu_gap[0] <= t < imu_gap[1]):
+            if call_lost and t_w is not None and t - t_w > 0.05:
+                sc.wheel_lost(t)
+            db = bias_step[2] if bias_step and bias_step[0] <= t < bias_step[1] else 0.0
+            sc.imu(t, a_lp + bias + db + rnd.gauss(0.0, 0.05))
+            rows.append((t, sc.observer_speed, v))
+        if i % 20 == 5 and not (lost[0] <= t < lost[1]):
+            vt = prof(t - 0.010)
+            f = fault[2] if fault and fault[0] <= t < fault[1] else 1.0
+            vw = vt * f + (rnd.gauss(0.0, 0.03) if abs(vt * f) > 1e-3 else 0.0)
+            sc.wheel(t, vw)
+            t_w = t
+    return sc, rows
+
+
+def dist_err(rows, t0, t1):
+    """Distance from the observer speed minus the true distance over [t0, t1] [m]."""
+    sel = [r for r in rows if t0 <= r[0] <= t1]
+    return sum((b[1] - b[2] + a[1] - a[2]) / 2 * (b[0] - a[0]) for a, b in zip(sel, sel[1:]))
+
+
+def test_wheel_lost_while_parked_then_drive():
+    """The wheel data dies while PARKED, then the car sets off (3 m/s^2): the observer must follow the IMU, not stay
+    at 0 (the old code: still 'parked' -> 0 m/s). Bias frozen meanwhile (the accelerations are not bias)."""
+    prof = lambda t: profile(t, stand=2.0, accel=3.0, cruise=4.0)        # noqa: E731
+    sc_new, rows = drive_lost(3.5, prof, lost=(1.5, 9.0))
+    v_new = rows[-1][1]
+    sc_old, rows_old = drive_lost(3.5, prof, lost=(1.5, 9.0), call_lost=False)
+    assert abs(v_new - prof(3.5)) < 0.3, f'observer {v_new:.2f} m/s, true {prof(3.5):.2f}'
+    assert abs(rows_old[-1][1]) < 0.05, f'the old code should stay parked (got {rows_old[-1][1]:.2f})'
+    sc_at_loss, _ = drive_lost(1.56, prof, lost=(1.5, 9.0))           # the same run, stopped just after the loss
+    assert abs(sc_new.bias - sc_at_loss.bias) < 1e-12, (f'bias changed during the dropout: {sc_at_loss.bias:.4f} -> '
+                                                         f'{sc_new.bias:.4f}')
+    assert abs(sc_old.bias - sc_at_loss.bias) > 0.5, 'the old code should learn the set-off as accelerometer bias'
+    assert abs(dist_err(rows, 2.0, 3.5)) < 0.15, f'distance error {dist_err(rows, 2.0, 3.5):.2f} m'
+
+
+def test_wheel_lost_while_braking():
+    """1 s without wheel data while braking 6 -> 2 m/s (F11b-like): distance error within the model's 1 sigma
+    (wheel_gap.WheelGap.sigma_d(1 s) = 0.19 m); held speed: > 1 m. Most of what remains is this synthetic IMU's 40 ms
+    smoothing: 5 m/s^2 x 40 ms ~ 0.2 m/s behind for the 0.8 s of braking ~ 16 cm."""
+    sc, rows = drive_lost(9.0, lively, lost=(6.0, 7.0))
+    e = dist_err(rows, 6.0, 7.0)
+    assert abs(e) < 0.19, f'distance error {e:.2f} m over the 1 s dropout'
+    held = sum((6.0 - lively(t / 100.0)) * 0.01 for t in range(600, 700))
+    assert held > 1.0, held                            # what holding 6 m/s would have cost
+
+
+def test_wheel_back_resyncs_no_false_slip():
+    """After the dropout the first wheel sample re-syncs the observer: no false WHEEL SLIP (job 221 F11c / F11d)."""
+    for lost in ((6.0, 7.0), (2.0, 5.0), (0.5, 3.0)):
+        sc, rows = drive_lost(12.0, lively, lost=lost)
+        assert sc.episodes == 0, f'{sc.episodes} false slip episodes after a dropout {lost}'
+        assert not sc.lost
+
+
+def test_wheel_back_after_drift_resyncs():
+    """A 2 s dropout during which the accelerometer bias jumps by 0.3 m/s^2 (a knock, warm-up): the IMU speed drifts
+    0.6 m/s away. The returning wheel must RE-SYNC it -- deciding on it would be a false slip (r > r0 0.20 m/s)."""
+    sc, rows = drive_lost(10.0, profile, lost=(5.0, 7.0), bias_step=(5.0, 7.0, 0.3))
+    drift = next(r[1] - r[2] for r in rows if r[0] >= 6.95)
+    assert abs(drift) > 0.4, f'the IMU speed should have drifted (got {drift:+.2f} m/s)'
+    assert sc.episodes == 0, f'{sc.episodes} false slip episodes after a drifted dropout'
+    after = [r for r in rows if 7.2 <= r[0] <= 7.5]
+    assert max(abs(r[1] - r[2]) for r in after) < 0.15, 'observer not back on the wheel speed after the re-sync'
+
+
+def test_wheel_back_old_code_false_slip():
+    """The same without wheel_lost (the old code) after a dropout while parked and setting off: a false slip -- the
+    reason for the re-sync."""
+    sc, _ = drive_lost(4.0, lambda t: profile(t, stand=2.0), lost=(1.5, 3.0), call_lost=False)
+    assert sc.episodes >= 1, 'expected the old false alarm'
+
+
+def test_wheel_lost_ends_a_slip():
+    """A wheelspin in progress when the wheel data dies: the flag ends ('wheel data lost'); the dropout is the EKF's
+    and state_estimate's business from there."""
+    sc, rows = drive_lost(8.0, profile, lost=(5.3, 6.5), fault=(5.0, 6.0, 1.15))
+    ev = [e for e in sc.pop_events()]
+    assert any((not on) and 'wheel data lost' in why for _, on, why, _ in ev), ev
+    assert sc.episodes == 1
+
+
+def test_imu_gap_during_wheel_loss_keeps_the_speed():
+    """IMU AND wheel silent: the observer must not jump to the STALE wheel speed 6 m/s (that would undo the braking
+    the IMU did see) -- it HOLDS its speed through the IMU gap. (It cannot know the braking it did not measure: with
+    both sensors silent the estimate is LOST after 50 ms anyway, Fix 2.)"""
+    sc, rows = drive_lost(9.0, lively, lost=(6.0, 7.5), imu_gap=(6.6, 6.7))
+    v_before = [r[1] for r in rows if r[0] < 6.6][-1]
+    v_after = next(r[1] for r in rows if r[0] >= 6.7)
+    assert abs(v_after - v_before) < 0.1, f'observer {v_before:.2f} -> {v_after:.2f} m/s across the IMU gap'
+    assert abs(v_after - 6.0) > 1.0, 'jumped back to the stale wheel speed 6 m/s'
+
+
+def test_no_bias_learning_while_lost():
+    """Parked with the wheel lost: stopped is never true -> the bias is not learned from whatever the IMU reads."""
+    sc, _ = drive_lost(3.0, lambda t: 0.0, lost=(1.0, 9.0), bias=0.08)
+    b1 = sc.bias
+    sc2, _ = drive_lost(6.0, lambda t: 0.0, lost=(1.0, 9.0), bias=0.08)
+    assert abs(sc2.bias - b1) < 1e-12, (b1, sc2.bias)
+
+
 if __name__ == '__main__':
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith('test_') and callable(f)]
     fails = 0

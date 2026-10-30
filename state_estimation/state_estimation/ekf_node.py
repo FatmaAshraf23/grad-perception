@@ -284,6 +284,25 @@ UPDATE 4 -- IMU DROPOUT: predict from wheel + steering (both modes, 2026-10-27, 
     REAL CAR: imu_gap_s from the IMU's real sample spacing (~2.5 periods), imu_gap_kus fitted on real laps, steering =
     the commanded angle (servo lag); keep imu_gap_predict false until control has accepted the stamp amendment.
 
+UPDATE 5 -- WHEEL-DATA DROPOUT: predict with the IMU speed (both modes, 2026-10-30, Fix 4; wheel_gap.py)
+    Why: the speed came from the LAST wheel message. When /vehicle/measured stopped (loose cable, ESP32 reset, bridge
+    crash) the EKFs kept the old speed forever and a parked car stayed "parked" (ZUPTs) while it drove off. Fault F11
+    (job 221, 6 m/s): 1 s while braking -> 1.56 m, 3 s -> 13.7 m, dropped while parked -> 52.6 m and never recovered
+    (AMCL gets its motion from the same frozen ekf_local), with std_xy 3-5 cm and the mode OK for up to 2.2 s.
+    What (wheel_gap.WheelGap): at every IMU sample, no wheel sample for > wheel_gap_s (50 ms) by the stamps AND the
+    receive times (not a backlog / stall) = DROPOUT. Then: the slip check's observer runs IMU-only (SlipCheck.wheel_lost:
+    not parked, no bias learning, a slip in progress ends) and the EKF predicts with ITS speed (true m/s, use_k False,
+    like a wheel slip), never "stopped" (no ZUPT; stopped_since cleared), with the speed noise
+    WheelGap.sigma_v_step -> the position variance along the heading grows like sigma_d(L) = wheel_gap_sigma_v0 * L +
+    0.5 * wheel_gap_sigma_a * L^2 (offline: 96-100 % of the errors inside 2 sigma). Without the slip check: the last
+    wheel speed, but still no ZUPT and the same growing uncertainty. The next wheel sample ends it; the slip observer
+    re-syncs to it (no false WHEEL SLIP). Offline (wheelgap_eval.py, validation p95 distance error at the end of the
+    gap): 0.5 s 7 cm, 1 s 12 cm, 2 s 13 cm (old code: 46 cm, 1.44 m, 3.17 m).
+    Out: <diag_prefix>/wheel_gap, log lines 'WHEEL DATA LOST' / 'wheel data back'. The MODE is state_estimate's (its own
+    clock: FLAG_WHEEL_STALE -> DEGRADED, LOST after wheel_lost_s).
+    wheel_gap_predict false = the old behaviour exactly (held speed, ZUPTs).
+    REAL CAR: wheel_gap_s ~ 2.5 periods of the real wheel rate; check sigma_v0 / sigma_a on real recordings.
+
 Topics
   in : /imu/data (gyro z; + accel x/y with wheel_delay_s >= 0 or slip_check), /vehicle/measured,
        /amcl_pose (global), /initialpose (global)
@@ -304,6 +323,9 @@ Topics
        <diag_prefix>/imu_gap (imu_gap_predict; std_msgs/Float64MultiArray, with every odometry while the gyro is not
            trusted and once when it is again: [stamp s, state 0 OK / 1 GAP / 2 RECOVERING, s since the last trusted
            gyro, yaw rate used rad/s]) ;
+       <diag_prefix>/wheel_gap (wheel_gap_predict; std_msgs/Float64MultiArray, with every IMU step while the wheel data
+           is lost and once when it is back: [stamp s, state 0 OK / 1 GAP, s since the last wheel sample, speed used
+           m/s, sigma_d m]) ;
        TF odom -> est/base_link (local only)
 
 CPU (2026-10-03): in Python ROS 2 the cost is mostly MESSAGES, not math. The sim
@@ -686,6 +708,7 @@ try:
     from state_estimation.imu_gap import GAP as IMU_GAP, ImuGap, STATE_NAMES as GAP_NAMES
     from state_estimation.vehicle_model import sideslip_from_params
     from state_estimation.wheel_delay import WheelSpeedCompensator
+    from state_estimation.wheel_gap import WheelGap
 except ImportError:
     Node = object
 
@@ -824,6 +847,12 @@ class EkfNode(Node):
         d('imu_gap_sigma_w', 0.4)           # rad/s: yaw-rate noise per prediction step during the dropout
         d('imu_gap_rec_n', 10)              # returning gyro trusted after this many samples in a row ...
         d('imu_gap_rec_tol', 0.5)           # rad/s ... that agree with the wheel model within this
+        # Wheel-data dropout (2026-10-30, Fix 4, docstring UPDATE 5, wheel_gap.py). ON by default: same stamps, same
+        # topics; only the speed during a dropout changes (the old: the last wheel speed, forever)
+        d('wheel_gap_predict', True)        # predict with the IMU speed while /vehicle/measured is silent
+        d('wheel_gap_s', 0.05)              # s without a wheel sample = dropout (2.5 periods at 50 Hz)
+        d('wheel_gap_sigma_v0', 0.14)       # m/s: distance uncertainty grows by this per s of dropout ...
+        d('wheel_gap_sigma_a', 0.1)         # m/s^2 ... + 0.5 * this * L^2 (an unlearned accelerometer-bias change)
         # Steering calibration (steer_calib); 'none' = use the measured steering as it is
         d('steer_calib_file', '~/.ros/steering_calibration.yaml')
         # Speed-scale calibration file (see docstring)
@@ -897,6 +926,11 @@ class EkfNode(Node):
         if p('imu_gap_predict'):
             self.gap = ImuGap(gap_s=p('imu_gap_s'), wheelbase=p('lf') + p('lr'), kus=p('imu_gap_kus'),
                               tau_b=p('imu_gap_tau_b'), rec_n=p('imu_gap_rec_n'), rec_tol=p('imu_gap_rec_tol'))
+        # wheel-data dropout (docstring UPDATE 5)
+        self.wgap = (WheelGap(gap_s=p('wheel_gap_s'), sv0=p('wheel_gap_sigma_v0'), sa=p('wheel_gap_sigma_a'))
+                     if p('wheel_gap_predict') else None)
+        self.wgap_last_pub = 0
+        self.wgap_steps = 0
         self.distance = 0.0
         self.truth = None
         self.truth_hist = deque(maxlen=400)
@@ -976,6 +1010,17 @@ class EkfNode(Node):
         else:
             self.get_logger().info('IMU dropout prediction OFF (imu_gap_predict false): the estimate stands still '
                                    'while the IMU is silent (the old behaviour)')
+        self.wgap_pub = (self.create_publisher(Float64MultiArray, pre + '/wheel_gap', 10)
+                         if self.wgap is not None else None)
+        if self.wgap is not None:
+            self.get_logger().info(
+                f"wheel-data dropout -> {pre}/wheel_gap: no wheel sample for > {1000 * p('wheel_gap_s'):.0f} ms -> "
+                + ('predict with the slip check\'s IMU speed' if self.slip is not None else
+                   'keep the last wheel speed (no slip check = no IMU speed)')
+                + f", no ZUPT, uncertainty {p('wheel_gap_sigma_v0'):g} m/s * L + 0.5 * {p('wheel_gap_sigma_a'):g} m/s^2 * L^2")
+        else:
+            self.get_logger().warn('wheel-data dropout handling OFF (wheel_gap_predict false): the last wheel speed is '
+                                   'used while /vehicle/measured is silent (the old behaviour)')
         if self.slip_gate is not None:      # SIMULATOR ONLY (docstring UPDATE 3)
             self.create_subscription(TwistStamped, ideal_topic, self.wheel_ideal_cb, 50)
         if self.slip is not None:
@@ -1103,6 +1148,9 @@ class EkfNode(Node):
         self.v = msg.drive.speed
         self.steer = self.steer_cal.correct(msg.drive.steering_angle)
         now = Time.from_msg(msg.header.stamp)
+        if self.wgap is not None:           # the end of a wheel-data dropout (docstring UPDATE 5)
+            self.wgap.wheel(now.nanoseconds * 1e-9, rx=self.get_clock().now().nanoseconds * 1e-9)
+            self.log_wgap()
         if self.slip is not None:           # wheel in TRUE m/s (docstring UPDATE 3)
             for row in self.slip.wheel(now.nanoseconds * 1e-9, float(self.ekf.x[4]) * self.v):
                 self.publish_slip(row)
@@ -1157,6 +1205,18 @@ class EkfNode(Node):
             else:
                 lg.warn(f'returning gyro disagrees with the wheel model by {a:+.2f} rad/s -> not trusted yet')
 
+    def log_wgap(self):
+        """One log line per wheel-data dropout event (docstring UPDATE 5)."""
+        for ev in self.wgap.pop_events():
+            if ev[0] == 'lost':
+                src = (f'the IMU speed {self.slip.observer_speed:.2f} m/s' if self.slip is not None
+                       else f'the last wheel speed {float(self.ekf.x[4]) * self.v:.2f} m/s')
+                self.get_logger().warn(f'WHEEL DATA LOST: no wheel sample for {1000 * (ev[1] - ev[2]):.0f} ms -> '
+                                       f'predicting with {src}, no ZUPT, growing uncertainty')
+            else:
+                self.get_logger().info(f'wheel data back after {ev[2]:.3f} s (wheel {float(self.ekf.x[4]) * self.v:.2f}'
+                                       f' m/s, IMU speed was {self.speed_used:.2f} m/s)')
+
     def is_stopped(self, now):
         if self.stopped_since is None:
             return False
@@ -1186,12 +1246,21 @@ class EkfNode(Node):
         if not trusted:                     # RECOVERING: predict with the wheel model, not the returning gyro
             w_m = self.gap.yaw_rate(t.nanoseconds * 1e-9) + float(self.ekf.x[3])
         a = msg.linear_acceleration
+        lost = False
+        if self.wgap is not None:           # wheel-data dropout, decided BEFORE the slip observer's step (UPDATE 5)
+            if self.wgap.imu(t.nanoseconds * 1e-9, rx=self.get_clock().now().nanoseconds * 1e-9):
+                self.stopped_since = None   # stale wheel data must not mean "parked"
+                if self.slip is not None:
+                    self.slip.wheel_lost(t.nanoseconds * 1e-9)
+                    self.log_slip()
+                self.log_wgap()
+            lost = self.wgap.lost
         slipping = False
         if self.slip is not None and trusted:   # docstring UPDATE 3 (no IMU data for it while untrusted)
             self.slip.imu(t.nanoseconds * 1e-9, self.imu_c * a.x - self.imu_s * a.y)
             self.log_slip()
             slipping = self.slip.on
-        stopped = self.is_stopped(t) and not slipping     # locked wheels while slipping: NOT parked
+        stopped = self.is_stopped(t) and not slipping and not lost     # locked wheels while slipping: NOT parked
         self.v_used = self.v
         if self.wheel_comp is not None and trusted:     # speed gained since the wheel value was true (true m/s)
             a = msg.linear_acceleration
@@ -1199,6 +1268,11 @@ class EkfNode(Node):
             self.v_used = self.v + dv / max(float(self.ekf.x[4]), 0.5)      # raw units, as v
         use_obs = slipping and self.slip_use
         self.speed_used = self.slip.observer_speed if use_obs else float(self.ekf.x[4]) * self.v_used
+        gap_obs = lost and self.slip is not None and self.slip.synced       # dropout: the IMU speed (UPDATE 5)
+        if gap_obs:
+            self.speed_used = self.slip.observer_speed
+        elif lost:
+            self.speed_used = float(self.ekf.x[4]) * self.v
 
         sw = None if trusted else self.gap_sigma_w
         if stopped and not trusted:         # no ZUPT from an untrusted gyro (docstring UPDATE 4)
@@ -1209,11 +1283,25 @@ class EkfNode(Node):
             self.log_standstill(self.still.moving())
             # sideslip (vehicle_model): 'steer' = kinematic from the steering, 'slip' = gyro + tyre slip
             beta = self.sideslip.beta(self.speed_used, w_m - self.ekf.x[3], self.steer)
-            if use_obs:                     # wheel slip: the IMU speed, true m/s, no wheel scale (UPDATE 3)
+            if lost:                        # wheel-data dropout: honest, growing speed noise (UPDATE 5)
+                sv = self.wgap.sigma_v_step(t.nanoseconds * 1e-9, dt)
+                if gap_obs:
+                    self.ekf.predict(self.speed_used, w_m, beta, dt, use_k=False, sigma_v=sv, sigma_w=sw)
+                else:
+                    self.ekf.predict(self.v, w_m, beta, dt, sigma_v=sv, sigma_w=sw)
+                self.wgap_steps += 1
+            elif use_obs:                   # wheel slip: the IMU speed, true m/s, no wheel scale (UPDATE 3)
                 self.ekf.predict(self.speed_used, w_m, beta, dt, use_k=False, sigma_v=self.slip_sigma_v, sigma_w=sw)
             else:
                 self.ekf.predict(self.v_used, w_m, beta, dt, sigma_w=sw)
             self.distance += abs(self.speed_used) * dt
+        if self.wgap is not None and (lost or self.wgap_last_pub):           # diagnostics (UPDATE 5)
+            t_s = t.nanoseconds * 1e-9
+            wm = Float64MultiArray()
+            wm.data = [t_s, float(self.wgap.state), self.wgap.gap_len(t_s), float(self.speed_used),
+                       self.wgap.sigma_d(self.wgap.gap_len(t_s))]
+            self.wgap_pub.publish(wm)
+            self.wgap_last_pub = self.wgap.state
 
         if self.fault is not None:                  # TEST ONLY (test_fault)
             if self.fault_t0 is None:
@@ -1607,6 +1695,10 @@ class EkfNode(Node):
             line += (f' | IMU dropouts {g.episodes}' + (f', longest {g.longest:.2f} s, wheel predictions '
                      f'{self.gap_predictions}, gyro rejects {g.rejects}' if g.episodes else '')
                      + (f' ({GAP_NAMES[g.state]})' if g.state else ''))
+        if self.wgap is not None and self.wgap.episodes:
+            w = self.wgap
+            line += (f' | wheel dropouts {w.episodes}, longest {w.longest:.2f} s, IMU-speed steps {self.wgap_steps}'
+                     + (' (WHEEL DATA LOST)' if w.lost else ''))
         st = self.still
         line += f' | ZUPTs {st.zupts}' + (f' | turned while standing: {st.turn_samples} samples' if st.turn_samples
                                           else '') + (f', bias changes {st.bias_changes}' if st.bias_changes else '')
