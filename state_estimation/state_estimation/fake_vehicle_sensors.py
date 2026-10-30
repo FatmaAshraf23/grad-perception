@@ -65,6 +65,11 @@ class FakeVehicleSensors(Node):
         # test_speed_factor 1.15
         self.declare_parameter('test_speed_factor', 1.0)
         self.test_factor_on = 1.0
+        # TEST ONLY (2026-10-30, fault F11 "wheel data lost": a loose cable, an ESP32 reset, a crashed bridge): true =
+        # publish NO /vehicle/measured (/sim/wheel_ideal keeps coming: evaluation only); runtime:
+        # ros2 param set /fake_vehicle_sensors test_drop true|false
+        self.declare_parameter('test_drop', False)
+        self.test_drop_on, self.test_dropped = False, 0
 
         p = lambda n: self.get_parameter(n).value  # noqa: E731
         self.true_speed = 0.0
@@ -135,6 +140,15 @@ class FakeVehicleSensors(Node):
         out.drive.speed = speed
         out.drive.steering_angle = (self.cmd_steer + p('steering_bias')
                                     + random.gauss(0.0, p('steering_noise')))
+        drop = bool(p('test_drop'))
+        if drop != self.test_drop_on:                 # TEST ONLY: wheel-data dropout switched on / off
+            self.test_drop_on = drop
+            self.get_logger().warn('TEST: wheel data dropout ON' if drop else
+                                   f'TEST: wheel data dropout OFF after {self.test_dropped} dropped messages')
+            self.test_dropped = 0
+        if drop:
+            self.test_dropped += 1
+            return
         self.pub.publish(out)
 
 
