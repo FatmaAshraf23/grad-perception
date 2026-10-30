@@ -1,0 +1,49 @@
+# car.yaml -- THE REAL CAR's settings (apex_bringup, 2026-10-30). Read + checked by apex_bringup/car_config.py when
+# car.launch.py starts: an unknown key, an impossible value or ANY simulator / test switch stops the launch with a list
+# of every problem. Where the sensors sit is NOT here: apex_description/config/sensor_mounts_car.yaml (one place).
+#
+# Units: metres, seconds, radians -- except names ending in _deg (degrees).
+#
+# not_measured: every name in this list still has a PLACEHOLDER value (a simulator value or a guess). Each one gives a
+# WARNING at start-up. When you have measured a value: write it below AND delete its name from this list.
+not_measured: [lf, lr, imu_yaw_deg, wheel_delay_s, slip_lag_s, imu_gap_s, slip_r0, imu_gap_kus]
+
+# Where THIS car's learned calibrations live (speed scale, steering calibration, slip fit record). Never ~/.ros itself:
+# that is where the SIMULATOR's calibrations are, and the car must not start from them. Written ONLY through
+# apex_bringup (car_calib.launch.py tool:=wheel / tool:=steer, car_slip_calib), which takes the paths from here.
+# Empty until the first calibration drive: the EKFs then use speed scale 1, steering offset 0 / gain 1.
+calibration_dir: ~/.ros/apex_car
+
+vehicle:
+  lf: 0.15875          # m, centre of gravity -> FRONT axle. Placeholder = F1TENTH reference car. Get it from the
+  lr: 0.17145          # m, centre of gravity -> REAR axle.  vehicle-dynamics teammate: the MPC must use the SAME.
+  imu_yaw_deg: 0.0     # deg, how the IMU's x axis is turned against the car's forward axis (CCW +). 0 = x forward
+  beta_model: steer    # sideslip model: steer (kinematic, nothing to fit) until slip_k is fitted on REAL laps,
+  slip_k: 0.0          # s^2/m: then beta_model: slip with the slip_k that car_slip_calib found
+
+timing:
+  wheel_delay_s: -1.0  # s, the wheel speed's own delay (tools/wheel_delay_calib.py, real recording); -1 = OFF
+  slip_lag_s: 0.03     # s, wheel vs IMU lag in the slip check -- depends on the MPU-6050 DLPF setting (ask embedded)
+  imu_gap_s: 0.025     # s without an IMU sample = DROPOUT; ~2.5 sample periods (100 Hz -> 0.025, 200 Hz -> 0.0125)
+
+estimator:
+  slip_check: true           # detect wheel slip (wheel speed vs IMU)
+  slip_use_observer: false   # false = only FLAG the slip; true = also predict with the IMU speed while slipping.
+                             # Keep false until slip_r0 is measured on the car (normal tyre slip must not trigger it)
+  slip_r0: 0.20              # m/s, slip ON threshold (simulator value)
+  imu_gap_predict: false     # predict from wheel + steering during an IMU dropout: only after control accepts
+                             # contract v0.4 (the wheel-based stamp)
+  imu_gap_kus: 0.0           # s^2/m understeer of the dropout yaw-rate model (fit on real laps with the gyro)
+  zupt_gate: 16.0            # standstill gate (Fix 1): above this the parked car is being turned by hand
+  zupt_turn_max_s: 3.0       # s
+  map_check: true            # map-mismatch alarm (contract v0.3)
+  amcl_corridor_sigma: 0.10  # m (corridor poses rule)
+  amcl_min_sigma_pos: 0.10   # m
+
+lidar:
+  serial_port: /dev/ttyUSB0  # the RPLIDAR's USB port (later a fixed name like /dev/rplidar from a udev rule)
+  serial_baudrate: 115200    # RPLIDAR A1M8
+  scan_mode: Sensitivity     # the mode the A1M8 reported on 22 Oct (job 188)
+  scan_frequency: 10.0       # Hz requested (the A1M8 delivered 7.7 Hz on 22 Oct)
+  deskew_mode: full          # scan_deskew: full | restamp | off
+  deskew_time_order: reverse # rplidar_ros beam order (checked against the driver source, job 163)
