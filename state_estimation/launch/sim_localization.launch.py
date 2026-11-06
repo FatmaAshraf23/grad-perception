@@ -103,7 +103,12 @@ def _ekfs_and_state_estimate(context):
                            # IMU dropout prediction (Fix 2): ON in the simulator only (node default false)
                            'imu_gap_predict': yes('imu_gap_predict'),
                            # wheel-data dropout (Fix 4): the IMU speed while /vehicle/measured is silent
-                           'wheel_gap_predict': yes('wheel_gap_predict')})
+                           'wheel_gap_predict': yes('wheel_gap_predict'),
+                           # AMCL fixes after an IMU dropout (2026-11-02, ekf_node UPDATE 6): defaults = off
+                           'gap_amcl_scale': float(arg('gap_amcl_scale')), 'gap_amcl_skip': yes('gap_amcl_skip'),
+                           'gap_amcl_hold_s': float(arg('gap_amcl_hold_s')),
+                           'gap_amcl_reopen_m': float(arg('gap_amcl_reopen_m')),
+                           'gap_amcl_reopen_deg': float(arg('gap_amcl_reopen_deg'))})
     se = dict(slip, **{'steer_calib_file': arg('steer_calib_file'), 'track': arg('track'),
                        'initialpose_topic': arg('initialpose_topic'),
                        'use_wheel_stale': yes('wheel_stale_mode')})
@@ -231,6 +236,12 @@ def generate_launch_description():
         # behaviour (the last wheel speed, held; FLAG_WHEEL_STALE without a mode change). Node defaults: both ON.
         DeclareLaunchArgument('wheel_gap_predict', default_value='true'),
         DeclareLaunchArgument('wheel_stale_mode', default_value='true'),
+        # AMCL fixes after an IMU dropout (2026-11-02, ekf_node UPDATE 6): scale 1 / skip false / hold 0 / reopen 0 / 0 = off
+        DeclareLaunchArgument('gap_amcl_scale', default_value='1.0'),
+        DeclareLaunchArgument('gap_amcl_skip', default_value='false'),
+        DeclareLaunchArgument('gap_amcl_hold_s', default_value='0.0'),
+        DeclareLaunchArgument('gap_amcl_reopen_m', default_value='0.0'),
+        DeclareLaunchArgument('gap_amcl_reopen_deg', default_value='0.0'),
         # AMCL along-track slide (2026-10-19, docstring): wheel-speed delay [s] for both EKFs
         # (-1 = compensation off) and AMCL's thin-wall map copy
         DeclareLaunchArgument('wheel_delay', default_value='0.010'),

@@ -74,6 +74,11 @@ def generate_launch_description():
                           'imu_gap_predict': LaunchConfiguration('imu_gap_predict'),
                           'wheel_gap_predict': LaunchConfiguration('wheel_gap_predict'),
                           'wheel_stale_mode': LaunchConfiguration('wheel_stale_mode'),
+                          'gap_amcl_scale': LaunchConfiguration('gap_amcl_scale'),
+                          'gap_amcl_skip': LaunchConfiguration('gap_amcl_skip'),
+                          'gap_amcl_hold_s': LaunchConfiguration('gap_amcl_hold_s'),
+                          'gap_amcl_reopen_m': LaunchConfiguration('gap_amcl_reopen_m'),
+                          'gap_amcl_reopen_deg': LaunchConfiguration('gap_amcl_reopen_deg'),
                           'initialpose_topic': LaunchConfiguration('initialpose_topic')}.items(),
     )
     driver = Node(
@@ -125,6 +130,11 @@ def generate_launch_description():
         DeclareLaunchArgument('imu_gap_predict', default_value='true'),    # IMU dropout prediction (Fix 2), false = off
         DeclareLaunchArgument('wheel_gap_predict', default_value='true'),  # wheel dropout: IMU speed (Fix 4), false = off
         DeclareLaunchArgument('wheel_stale_mode', default_value='true'),   # wheel dropout -> DEGRADED / LOST (Fix 4)
+        DeclareLaunchArgument('gap_amcl_scale', default_value='1.0'),   # ekf_node UPDATE 6 (off)
+        DeclareLaunchArgument('gap_amcl_skip', default_value='false'),   # ekf_node UPDATE 6 (off)
+        DeclareLaunchArgument('gap_amcl_hold_s', default_value='0.0'),   # ekf_node UPDATE 6 (off)
+        DeclareLaunchArgument('gap_amcl_reopen_m', default_value='0.0'),   # ekf_node UPDATE 6 (off)
+        DeclareLaunchArgument('gap_amcl_reopen_deg', default_value='0.0'),   # ekf_node UPDATE 6 (off)
         DeclareLaunchArgument('initialpose_topic', default_value='/initialpose'),  # tests: /initialpose_est
         DeclareLaunchArgument('start_delay', default_value='3.0'),         # s parked before the test driver drives
         # CPU rule (also for test_driver and eval_logger, which start here)

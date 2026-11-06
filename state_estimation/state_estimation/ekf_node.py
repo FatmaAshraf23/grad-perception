@@ -303,6 +303,21 @@ UPDATE 5 -- WHEEL-DATA DROPOUT: predict with the IMU speed (both modes, 2026-10-
     wheel_gap_predict false = the old behaviour exactly (held speed, ZUPTs).
     REAL CAR: wheel_gap_s ~ 2.5 periods of the real wheel rate; check sigma_v0 / sigma_a on real recordings.
 
+UPDATE 6 -- AMCL FIXES AFTER AN IMU DROPOUT ARE NOT INDEPENDENT (global EKF, 2026-11-02; gap_amcl.py)
+    Why (job 230, cornerunc_update/analysis/amcl_gap_diag.py): AMCL moves its particles with ekf_local's odometry,
+    which drifts in the SAME IMU dropout as this EKF. So for a while AMCL's fixes copy this EKF's own error (corner
+    dropouts: correlation ~0.9; clean driving ~0.3), and fusing ~7 of them per second as independent kept std_xy at
+    3-6 cm while the error reached 10-30 cm (NEES up to 14, honest ~2) -- worst 0-2 s AFTER the dropout (G1, braking
+    corner entry). Then the too-small P gave AMCL's recovered fixes too little weight (slow recovery).
+    What (gap_amcl.GapFixWeight): a CONTAMINATED WINDOW per dropout, by the fix's scan stamp: from the last trusted
+    gyro sample to gap_amcl_hold_s after the gyro is trusted again. In it: gap_amcl_skip -> fixes scanned while the
+    gyro is not trusted are skipped; otherwise R x gap_amcl_scale. At the first fix after the window: position
+    variance + gap_amcl_reopen_m^2 and heading variance + gap_amcl_reopen_deg^2 once (the EKF listens to AMCL
+    again; the heading too: job 232, G1 heading error 4-9 deg vs std 1.0-1.6 deg after the dropout). Needs
+    imu_gap_predict (the dropout events). Defaults (scale 1, no skip, hold 0, reopen 0 / 0) = the old behaviour exactly. Out: report line 'after-dropout fixes
+    skipped / weak', log line 're-open'.
+    REAL CAR: only with imu_gap_predict; the hold time depends on how fast AMCL re-converges with the real LiDAR.
+
 Topics
   in : /imu/data (gyro z; + accel x/y with wheel_delay_s >= 0 or slip_check), /vehicle/measured,
        /amcl_pose (global), /initialpose (global)
@@ -706,6 +721,7 @@ try:
                                             shift_search)
     from state_estimation.slip_check import SimGate, SlipCheck
     from state_estimation.imu_gap import GAP as IMU_GAP, ImuGap, STATE_NAMES as GAP_NAMES
+    from state_estimation.gap_amcl import SKIP as GAP_SKIP, WEAK as GAP_WEAK, GapFixWeight
     from state_estimation.vehicle_model import sideslip_from_params
     from state_estimation.wheel_delay import WheelSpeedCompensator
     from state_estimation.wheel_gap import WheelGap
@@ -847,6 +863,11 @@ class EkfNode(Node):
         d('imu_gap_sigma_w', 0.4)           # rad/s: yaw-rate noise per prediction step during the dropout
         d('imu_gap_rec_n', 10)              # returning gyro trusted after this many samples in a row ...
         d('imu_gap_rec_tol', 0.5)           # rad/s ... that agree with the wheel model within this
+        d('gap_amcl_scale', 1.0)            # AMCL R x this in the window after an IMU dropout (UPDATE 6); 1 = off
+        d('gap_amcl_skip', False)           # skip AMCL fixes scanned while the gyro is not trusted
+        d('gap_amcl_hold_s', 0.0)           # s: the window lasts this long after the gyro is trusted again
+        d('gap_amcl_reopen_m', 0.0)         # m: + this std on x and y once after the window; 0 = off
+        d('gap_amcl_reopen_deg', 0.0)       # deg: + this std on the heading once after the window; 0 = off
         # Wheel-data dropout (2026-10-30, Fix 4, docstring UPDATE 5, wheel_gap.py). ON by default: same stamps, same
         # topics; only the speed during a dropout changes (the old: the last wheel speed, forever)
         d('wheel_gap_predict', True)        # predict with the IMU speed while /vehicle/measured is silent
@@ -926,6 +947,17 @@ class EkfNode(Node):
         if p('imu_gap_predict'):
             self.gap = ImuGap(gap_s=p('imu_gap_s'), wheelbase=p('lf') + p('lr'), kus=p('imu_gap_kus'),
                               tau_b=p('imu_gap_tau_b'), rec_n=p('imu_gap_rec_n'), rec_tol=p('imu_gap_rec_tol'))
+        self.gfw = None                     # AMCL fixes after an IMU dropout (docstring UPDATE 6)
+        if self.gap is not None:
+            gfw = GapFixWeight(scale=p('gap_amcl_scale'), hold_s=p('gap_amcl_hold_s'),
+                               reopen_m=p('gap_amcl_reopen_m'), skip_in_gap=p('gap_amcl_skip'),
+                               reopen_deg=p('gap_amcl_reopen_deg'))
+            self.gfw = gfw if gfw.enabled else None
+        if self.gfw is not None:
+            self.get_logger().info(
+                f"AMCL fixes after an IMU dropout (UPDATE 6): {'skipped' if self.gfw.skip_in_gap else f'R x {self.gfw.scale:g}'}"
+                f" while the gyro is not trusted, R x {self.gfw.scale:g} for {self.gfw.hold_s:g} s after, then position std"
+                f" + {100 * self.gfw.reopen_m:g} cm, heading std + {math.degrees(self.gfw.reopen_yaw):g} deg once")
         # wheel-data dropout (docstring UPDATE 5)
         self.wgap = (WheelGap(gap_s=p('wheel_gap_s'), sv0=p('wheel_gap_sigma_v0'), sa=p('wheel_gap_sigma_a'))
                      if p('wheel_gap_predict') else None)
@@ -1195,6 +1227,11 @@ class EkfNode(Node):
         """One log line per dropout event (docstring UPDATE 4)."""
         lg = self.get_logger()
         for kind, t_s, a, g_s in self.gap.pop_events():
+            if self.gfw is not None:        # the contaminated window for AMCL fixes (docstring UPDATE 6)
+                if kind == 'gap':
+                    self.gfw.start(a)
+                elif kind == 'valid':
+                    self.gfw.end(t_s)
             if kind == 'gap':
                 lg.warn(f'IMU DROPOUT: no trusted IMU sample for {1000 * (t_s - a):.0f} ms -> predicting from wheel + '
                         f'steering (yaw rate {self.gap.yaw_rate(t_s):+.2f} rad/s, last gyro {self.gap.r_trusted:+.2f})')
@@ -1379,6 +1416,22 @@ class EkfNode(Node):
                                    p('amcl_min_sigma_pos'),
                                    math.radians(p('amcl_min_sigma_yaw_deg')))
         self.record_amcl_error(t_ns, z)
+        if self.gfw is not None:            # after an IMU dropout: not independent (docstring UPDATE 6)
+            gk = self.gfw.classify(t_ns * 1e-9)
+            if gk == GAP_SKIP:
+                self.stats['gap_skip'] += 1
+                return
+            if gk == GAP_WEAK:
+                R = R * self.gfw.factor(gk)
+                self.stats['gap_weak'] += 1
+            s_open, y_open = self.gfw.reopen(t_ns * 1e-9)
+            if s_open > 0.0 or y_open > 0.0:
+                self.ekf.P[0, 0] += s_open ** 2
+                self.ekf.P[1, 1] += s_open ** 2
+                self.ekf.P[2, 2] += y_open ** 2
+                self.get_logger().info(f'AMCL fixes clean again after the IMU dropout -> position std '
+                                       f'+{100 * s_open:.0f} cm, heading std +{math.degrees(y_open):.1f} deg '
+                                       'once (re-open, UPDATE 6)')
         cov = msg.pose.covariance
         kind = amcl_pose_class(cov[0], cov[1], cov[7], p('amcl_max_sigma'), p('amcl_corridor_sigma'))
         if kind == 'unsure':
@@ -1671,6 +1724,8 @@ class EkfNode(Node):
                     if s['amcl_err'] else ' n/a')
             line += (f" | AMCL used {s['acc']:2d} rej {s['rej']:2d} unsure {s['unsure']:2d}"
                      f" corridor {s['corridor']:2d} NIS {mean_nis:4.1f} AMCL err {amcl}")
+            if s['gap_skip'] or s['gap_weak']:
+                line += f" | after-dropout fixes skipped {s['gap_skip']} weak {s['gap_weak']}"
             if s['refused'] or s['jumps']:
                 line += f" | jump refused {s['refused']} JUMPED {s['jumps']}"
             fit = self.scan_fit_now()
@@ -1708,7 +1763,7 @@ class EkfNode(Node):
     @staticmethod
     def new_stats():
         return {'acc': 0, 'rej': 0, 'nis': 0.0, 'amcl_err': [], 'unsure': 0, 'corridor': 0, 'refused': 0,
-                'jumps': 0}
+                'jumps': 0, 'gap_skip': 0, 'gap_weak': 0}
 
     @staticmethod
     def new_mc_stats():
