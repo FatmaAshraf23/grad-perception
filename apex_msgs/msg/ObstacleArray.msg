@@ -22,3 +22,10 @@ float32 max_range_m            # obstacles farther than this from the LiDAR are 
 float32 blind_strip_m          # obstacles closer than this to a wall of the map can't be detected
 
 Obstacle[] obstacles
+
+# --- camera (schema "apex-obstacles/0.2", 2026-11-07): filled only on /obstacles/fused ------------------------------
+uint8 CAMERA_OFF = 0           # no camera fusion (the plain LiDAR list /obstacles)
+uint8 CAMERA_OK = 1            # pictures are being used
+uint8 CAMERA_STALE = 2         # no picture used for longer than the fusion's camera_stale_s (camera fields = old evidence)
+uint8 camera_status
+float32 camera_age_ms          # age of the newest USED picture when this message was sent (-1 = none yet)

@@ -6,7 +6,7 @@ package_name = 'sensor_fusion'
 
 setup(
     name=package_name,
-    version='0.1.0',
+    version='0.2.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
@@ -17,7 +17,7 @@ setup(
     zip_safe=True,
     maintainer='fatma',
     maintainer_email='fatma@todo.todo',
-    description='Camera-LiDAR fusion: projection (LiDAR point <-> pixel), camera-LiDAR extrinsic calibration, fake camera, camera latency test + demos',
+    description='Camera-LiDAR fusion: camera confirmation of LiDAR obstacles (fusion_node), projection (LiDAR point <-> pixel), camera-LiDAR extrinsic calibration, fake camera, camera latency test + demos',
     license='MIT',
     tests_require=['pytest'],
     entry_points={
@@ -30,6 +30,7 @@ setup(
             'fake_camera = sensor_fusion.fake_camera:main',
             'latency_probe = sensor_fusion.latency_probe:main',
             'flash_window = sensor_fusion.flash_window:main',
+            'fusion_node = sensor_fusion.fusion_node:main',
         ],
     },
 )

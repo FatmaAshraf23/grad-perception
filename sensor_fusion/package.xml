@@ -2,7 +2,7 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>sensor_fusion</name>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <description>Camera-LiDAR fusion: projection.py (LiDAR point &lt;-&gt; pixel, lens model, ground plane, cone boxes; numpy only), lidar_camera_calib.py (camera-LiDAR extrinsic calibration with a checkerboard, Zhang-Pless), calib_capture / calib_solve (record + solve a session on the car), calib_fake_session (test without hardware), fake_camera (the simulator's camera + YOLO -> /camera/detections), latency_probe + flash_window (how late the camera's time stamps are) + demos.</description>
   <maintainer email="fatma@todo.todo">fatma</maintainer>
   <license>MIT</license>
@@ -19,6 +19,7 @@
   <exec_depend>apex_description</exec_depend>
   <exec_depend>apex_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
   <exec_depend>camera_publisher</exec_depend>
 
   <exec_depend>python3-opencv</exec_depend>
