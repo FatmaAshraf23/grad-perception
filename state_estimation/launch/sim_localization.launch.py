@@ -129,7 +129,9 @@ def _ekfs_and_state_estimate(context):
         'odom_topic': '/odom/ekf', 'path_topic': '/odom/ekf_path',
         'diag_prefix': '/ekf', 'truth_topic': arg('ekf_truth_topic'),
         'test_fault': arg('ekf_test_fault'), 'allow_test_faults': yes('allow_test_faults'),
-        'initialpose_topic': arg('initialpose_topic')})
+        'initialpose_topic': arg('initialpose_topic'),
+        # stamp-ordered inputs (2026-11-07, state_pipeline / input_order.py; merged pipeline only): default ON
+        'order_inputs': yes('order_inputs'), 'order_wait_s': float(arg('order_wait_s'))})
     with_se = yes('state_estimate')
     pipeline = arg('pipeline').lower()
 
@@ -242,6 +244,9 @@ def generate_launch_description():
         DeclareLaunchArgument('gap_amcl_hold_s', default_value='0.0'),
         DeclareLaunchArgument('gap_amcl_reopen_m', default_value='0.0'),
         DeclareLaunchArgument('gap_amcl_reopen_deg', default_value='0.0'),
+        # stamp-ordered inputs (2026-11-07, estimator-stall fix A; merged pipeline only): ON; false = the old arrival order
+        DeclareLaunchArgument('order_inputs', default_value='true'),
+        DeclareLaunchArgument('order_wait_s', default_value='0.025'),
         # AMCL along-track slide (2026-10-19, docstring): wheel-speed delay [s] for both EKFs
         # (-1 = compensation off) and AMCL's thin-wall map copy
         DeclareLaunchArgument('wheel_delay', default_value='0.010'),

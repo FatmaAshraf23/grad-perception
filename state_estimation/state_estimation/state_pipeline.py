@@ -36,6 +36,11 @@ PARAMETERS
     executable with a node-name remap (__node:=...): it would rename all three.
     Argument --no-state-estimate: only the two EKFs.
 
+STAMP-ORDERED INPUTS (2026-11-07, input_order.py, parameter order_inputs on ekf_global, default ON):
+    in a backlog the executor takes one message per queue per round, so the 50 Hz wheel queue ran
+    ahead of the 100 Hz IMU queue in time and the EKFs predicted with a wheel speed from the future
+    (F07: up to 3.5 m/s wrong). ON: a wheel message waits until the IMU is processed up to its stamp.
+
 Real car: identical -- this is what should run on the Pi (inputs from the STM32
 bridge, the MPU-6050 driver and rplidar instead of the simulator).
 """
@@ -50,6 +55,7 @@ from rclpy.utilities import remove_ros_args
 from sensor_msgs.msg import Imu
 
 from state_estimation.ekf_node import EkfNode
+from state_estimation.input_order import InputOrder
 from state_estimation.state_estimate_node import StateEstimateNode
 
 try:
@@ -103,6 +109,32 @@ def main(args=None):
         glob.declare_parameter('test_lag_ms', 0.0)
     lag_on = [0.0]
 
+    # STAMP-ORDERED INPUTS (estimator-stall fix A, 2026-11-07, input_order.py): in a backlog the executor
+    # drains the 50 Hz wheel queue twice as fast in time as the 100 Hz IMU queue -> the EKFs predicted with a
+    # wheel speed from the FUTURE (F07: speed error up to 3.5 m/s). ON: a wheel message waits until the IMU
+    # has been processed up to its stamp (released anyway after order_wait_s without any IMU = a dropout).
+    # Default ON since 2026-11-07 (jobs 239-240: no change in normal driving); false = the old arrival order.
+    glob.declare_parameter('order_inputs', True)
+    glob.declare_parameter('order_wait_s', 0.025)
+    order = None
+    if glob.get_parameter('order_inputs').value:
+        order = InputOrder(wait_s=float(glob.get_parameter('order_wait_s').value))
+        glob.get_logger().info(
+            f'stamp-ordered inputs ON: a wheel message ahead of the IMU waits for it (released after '
+            f'{1000 * order.wait_s:.0f} ms without any IMU message = a dropout)')
+        glob.create_timer(5.0, lambda: glob.get_logger().info(order.report()))
+    else:
+        glob.get_logger().info('stamp-ordered inputs OFF (order_inputs false): messages in arrival order (TEST ONLY: the old behaviour)')
+
+    def stamp_s(msg):
+        return msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec
+
+    def wheel_now(msg):
+        if se_wheel:
+            se_wheel(msg)
+        local.meas_cb(msg)
+        glob.meas_cb(msg)
+
     def on_imu(msg):                             # 100 Hz (sim) / 200 Hz (real car)
         if test_switches:
             lag = float(glob.get_parameter('test_lag_ms').value)
@@ -111,16 +143,20 @@ def main(args=None):
                 glob.get_logger().warn(f'TEST: estimator lag {lag:.1f} ms extra work per IMU message')
             if lag > 0.0:
                 time.sleep(lag / 1000.0)
+        if order is not None:                    # waiting wheel messages up to this IMU stamp go FIRST
+            for w in order.imu(stamp_s(msg), time.monotonic()):
+                wheel_now(w)
         if se_imu:
             se_imu(msg)                          # freshness first
         local.imu_cb(msg)                        # -> TF odom -> est/base_link (for AMCL)
         glob.imu_cb(msg)                         # -> /odom/ekf -> state_estimate -> /state_estimate
 
     def on_wheel(msg):                           # 50 Hz
-        if se_wheel:
-            se_wheel(msg)
-        local.meas_cb(msg)
-        glob.meas_cb(msg)
+        if order is None:
+            wheel_now(msg)
+            return
+        for w in order.wheel(stamp_s(msg), msg, time.monotonic()):
+            wheel_now(w)
 
     # the two shared subscriptions live on ekf_global (any of the three nodes would do)
     glob.create_subscription(Imu, '/imu/data', on_imu, 100)
