@@ -4,7 +4,7 @@ package_name = 'camera_publisher'
 
 setup(
     name=package_name,
-    version='0.0.0',
+    version='0.1.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -28,6 +28,7 @@ setup(
           'camera_node = camera_publisher.camera_node:main',
           'image_viewer = camera_publisher.image_viewer:main',
           'yolo_node = camera_publisher.yolo_node:main',
+          'detection_bridge = camera_publisher.detection_bridge:main',
 ],
     },
 )
