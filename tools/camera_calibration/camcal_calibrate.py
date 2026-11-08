@@ -14,8 +14,9 @@ HOW
      pictures and bad on new ones.
 OUTPUT (into the captures folder)
   calibration_<W>x<H>.yaml  -- ROS camera_info format (camera_name, K, D, R, P), full resolution + scaled copies for
-                               smaller pictures with the SAME 16:9 framing (focal lengths and centre scale, D stays);
-                               NOT valid for 640 x 480 (4:3 = a different crop of the sensor).
+                               smaller pictures with the SAME framing (focal lengths and centre scale, D stays): the 16:9
+                               list for a 16:9 camera + exact halves / quarters for any camera (Pi Camera V2
+                               1640 x 1232 -> 820 x 616, 410 x 308); never a size that would need a CROP.
   calibration_report.txt, per_image.csv, undistort_check.jpg (original | undistorted: straight edges must look straight)
 Usage: python camcal_calibrate.py <captures folder> [--cols 9 --rows 6 --square 0.025]"""
 import argparse
@@ -173,7 +174,11 @@ def main():
     tilt = [np.degrees(np.arccos(abs(cv2.Rodrigues(r)[0][2, 2]))) for r in rv]
     dist = [float(np.linalg.norm(t)) for t in tv]
     say(f'board distance {min(dist):.2f}-{max(dist):.2f} m, tilt {min(tilt):.0f}-{max(tilt):.0f} deg')
+    # pure SHRINKS of this picture only (same framing): the 16:9 list for 16:9 cameras + exact halves / quarters for any
+    # camera (2026-11-08: the Pi Camera V2's full-view 4:3 mode 1640 x 1232 -> 820 x 616, 410 x 308; a 16:9 size of a
+    # 4:3 picture would need a CROP and is never written)
     sizes = [(w, h)] + [s for s in SCALED if s[0] < w and abs(s[0] / s[1] - w / h) < 1e-3]
+    sizes += [(w // d, h // d) for d in (2, 4) if w % d == 0 and h % d == 0 and (w // d, h // d) not in sizes]
     for sw, sh in sizes:
         s = sw / w
         Ks = K.copy()
