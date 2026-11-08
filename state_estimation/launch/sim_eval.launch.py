@@ -81,6 +81,7 @@ def generate_launch_description():
                           'gap_amcl_reopen_deg': LaunchConfiguration('gap_amcl_reopen_deg'),
                           'order_inputs': LaunchConfiguration('order_inputs'),
                           'order_wait_s': LaunchConfiguration('order_wait_s'),
+                          'wheel_stuck_check': LaunchConfiguration('wheel_stuck_check'),
                           'initialpose_topic': LaunchConfiguration('initialpose_topic')}.items(),
     )
     driver = Node(
@@ -139,6 +140,7 @@ def generate_launch_description():
         DeclareLaunchArgument('gap_amcl_reopen_deg', default_value='0.0'),   # ekf_node UPDATE 6 (off)
         DeclareLaunchArgument('order_inputs', default_value='true'),         # stamp-ordered inputs (2026-11-07, ON; false = old order)
         DeclareLaunchArgument('order_wait_s', default_value='0.025'),        # s without IMU = a dropout
+        DeclareLaunchArgument('wheel_stuck_check', default_value='true'),    # F12 stuck wheel (2026-11-08, ON; false = old)
         DeclareLaunchArgument('initialpose_topic', default_value='/initialpose'),  # tests: /initialpose_est
         DeclareLaunchArgument('start_delay', default_value='3.0'),         # s parked before the test driver drives
         # CPU rule (also for test_driver and eval_logger, which start here)

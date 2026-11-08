@@ -131,7 +131,9 @@ def _ekfs_and_state_estimate(context):
         'test_fault': arg('ekf_test_fault'), 'allow_test_faults': yes('allow_test_faults'),
         'initialpose_topic': arg('initialpose_topic'),
         # stamp-ordered inputs (2026-11-07, state_pipeline / input_order.py; merged pipeline only): default ON
-        'order_inputs': yes('order_inputs'), 'order_wait_s': float(arg('order_wait_s'))})
+        'order_inputs': yes('order_inputs'), 'order_wait_s': float(arg('order_wait_s')),
+        # stuck-wheel check (2026-11-08, F12, state_pipeline / wheel_stuck.py; merged pipeline only): default ON
+        'wheel_stuck_check': yes('wheel_stuck_check')})
     with_se = yes('state_estimate')
     pipeline = arg('pipeline').lower()
 
@@ -247,6 +249,7 @@ def generate_launch_description():
         # stamp-ordered inputs (2026-11-07, estimator-stall fix A; merged pipeline only): ON; false = the old arrival order
         DeclareLaunchArgument('order_inputs', default_value='true'),
         DeclareLaunchArgument('order_wait_s', default_value='0.025'),
+        DeclareLaunchArgument('wheel_stuck_check', default_value='true'),
         # AMCL along-track slide (2026-10-19, docstring): wheel-speed delay [s] for both EKFs
         # (-1 = compensation off) and AMCL's thin-wall map copy
         DeclareLaunchArgument('wheel_delay', default_value='0.010'),

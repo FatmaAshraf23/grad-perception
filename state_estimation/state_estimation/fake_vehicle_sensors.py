@@ -62,7 +62,7 @@ class FakeVehicleSensors(Node):
         self.declare_parameter('track_tau_s', 0.2)
         # TEST ONLY (2026-10-20, fault scenarios for control): the reported wheel speed is multiplied by this
         # (> 1 = wheel spin, < 1 = wheels slipping / locking); runtime: ros2 param set /fake_vehicle_sensors
-        # test_speed_factor 1.15
+        # test_speed_factor 1.15. 0.0 = F12 "wheel stuck at 0 while driving": reads EXACTLY 0 (no noise), like a dead encoder
         self.declare_parameter('test_speed_factor', 1.0)
         self.test_factor_on = 1.0
         # TEST ONLY (2026-10-30, fault F11 "wheel data lost": a loose cable, an ESP32 reset, a crashed bridge): true =
@@ -135,7 +135,8 @@ class FakeVehicleSensors(Node):
             self.test_factor_on = f
             self.get_logger().warn(f'TEST: wheel speed x {f:.3f}')
         speed = true_speed * (1.0 + p('speed_scale_error')) * f
-        if abs(true_speed) > 1e-3:               # a stopped wheel reads zero
+        if abs(true_speed) > 1e-3 and f != 0.0:  # a stopped wheel reads zero; so does a STUCK one (F12, factor 0:
+            # a loose magnet / broken encoder wire gives exactly 0 counts, not noise around 0 -- 2026-11-08)
             speed += random.gauss(0.0, p('speed_noise'))
         out.drive.speed = speed
         out.drive.steering_angle = (self.cmd_steer + p('steering_bias')

@@ -43,6 +43,11 @@ STAMP-ORDERED INPUTS (2026-11-07, input_order.py, parameter order_inputs on ekf_
 
 Real car: identical -- this is what should run on the Pi (inputs from the STM32
 bridge, the MPU-6050 driver and rplidar instead of the simulator).
+STUCK WHEEL (2026-11-08, F12, wheel_stuck.py, parameter wheel_stuck_check on ekf_global, default ON):
+  a dead encoder that keeps SENDING 0 while the car drives (job 252: 55 cm after 1 s, 16 m after 10 s with a false
+  "parked"). Such a 0 is DROPPED here, before the EKFs and state_estimate: to them it is missing wheel data, so the
+  tested F11 path (wheel_gap.py) takes over -- IMU speed, never parked, honest uncertainty, WHEEL_STALE ->
+  DEGRADED -> LOST after wheel_lost_s. Back after 3 plausible non-zero samples. false = the old behaviour (TEST ONLY).
 """
 import sys
 import time
@@ -56,6 +61,7 @@ from sensor_msgs.msg import Imu
 
 from state_estimation.ekf_node import EkfNode
 from state_estimation.input_order import InputOrder
+from state_estimation.wheel_stuck import StuckWheel
 from state_estimation.state_estimate_node import StateEstimateNode
 
 try:
@@ -129,7 +135,39 @@ def main(args=None):
     def stamp_s(msg):
         return msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec
 
+    # STUCK WHEEL (F12, 2026-11-08, wheel_stuck.py): a 0 while the car drives is a dead encoder, not a stop ->
+    # dropped HERE (after the stamp order: the samples arrive in time order), so the EKFs and state_estimate see
+    # missing wheel data and Fix 4's wheel-lost path (wheel_gap.py, F11) takes over.
+    glob.declare_parameter('wheel_stuck_check', True)
+    glob.declare_parameter('wheel_stuck_v_min', 0.5)     # m/s: a 0 right after more than this = stuck
+    stuck = None
+    if glob.get_parameter('wheel_stuck_check').value:
+        stuck = StuckWheel(v_min=float(glob.get_parameter('wheel_stuck_v_min').value))
+        glob.get_logger().info(
+            f'stuck-wheel check ON: a wheel speed of ~0 right after > {stuck.v_min:.1f} m/s (wheel or IMU speed) is a '
+            f'dead encoder -> treated as missing wheel data (back after {stuck.k_back} plausible samples)')
+    else:
+        glob.get_logger().info('stuck-wheel check OFF (wheel_stuck_check false): a stuck 0 reaches the EKF (TEST ONLY)')
+
+    def imu_speed():
+        sl = glob.slip
+        return sl.observer_speed if sl is not None and sl.synced and not sl.lost else None
+
     def wheel_now(msg):
+        if stuck is not None:
+            drop = stuck.check(stamp_s(msg), msg.drive.speed, imu_speed())
+            for ev in stuck.pop_events():
+                if ev[0] == 'stuck':
+                    glob.get_logger().warn(
+                        f'WHEEL STUCK: the wheel reads {msg.drive.speed:.2f} m/s right after '
+                        + (f'{ev[2]:.2f} m/s' if ev[2] is not None else 'no good sample')
+                        + (f' (IMU speed {ev[3]:.2f} m/s)' if ev[3] is not None else '')
+                        + ' -- a dead encoder, not a stop: its samples are DROPPED (= missing wheel data)')
+                else:
+                    glob.get_logger().info(f'wheel back after {ev[2]:.2f} s stuck ({ev[3]} samples dropped): '
+                                           f'{msg.drive.speed:.2f} m/s')
+            if drop:
+                return
         if se_wheel:
             se_wheel(msg)
         local.meas_cb(msg)
