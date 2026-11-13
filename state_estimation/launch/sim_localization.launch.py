@@ -241,11 +241,11 @@ def generate_launch_description():
         DeclareLaunchArgument('wheel_gap_predict', default_value='true'),
         DeclareLaunchArgument('wheel_stale_mode', default_value='true'),
         # AMCL fixes after an IMU dropout (2026-11-02, ekf_node UPDATE 6): scale 1 / skip false / hold 0 / reopen 0 / 0 = off
-        DeclareLaunchArgument('gap_amcl_scale', default_value='1.0'),
+        DeclareLaunchArgument('gap_amcl_scale', default_value='4.0'),   # V6a, sim default ON (2026-11-13; car: off)
         DeclareLaunchArgument('gap_amcl_skip', default_value='false'),
-        DeclareLaunchArgument('gap_amcl_hold_s', default_value='0.0'),
-        DeclareLaunchArgument('gap_amcl_reopen_m', default_value='0.0'),
-        DeclareLaunchArgument('gap_amcl_reopen_deg', default_value='0.0'),
+        DeclareLaunchArgument('gap_amcl_hold_s', default_value='0.5'),   # V6a, sim default ON (2026-11-13; car: off)
+        DeclareLaunchArgument('gap_amcl_reopen_m', default_value='0.10'),   # V6a, sim default ON (2026-11-13; car: off)
+        DeclareLaunchArgument('gap_amcl_reopen_deg', default_value='3.0'),   # V6a, sim default ON (2026-11-13; car: off)
         # stamp-ordered inputs (2026-11-07, estimator-stall fix A; merged pipeline only): ON; false = the old arrival order
         DeclareLaunchArgument('order_inputs', default_value='true'),
         DeclareLaunchArgument('order_wait_s', default_value='0.025'),

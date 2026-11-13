@@ -133,11 +133,11 @@ def generate_launch_description():
         DeclareLaunchArgument('imu_gap_predict', default_value='true'),    # IMU dropout prediction (Fix 2), false = off
         DeclareLaunchArgument('wheel_gap_predict', default_value='true'),  # wheel dropout: IMU speed (Fix 4), false = off
         DeclareLaunchArgument('wheel_stale_mode', default_value='true'),   # wheel dropout -> DEGRADED / LOST (Fix 4)
-        DeclareLaunchArgument('gap_amcl_scale', default_value='1.0'),   # ekf_node UPDATE 6 (off)
+        DeclareLaunchArgument('gap_amcl_scale', default_value='4.0'),   # ekf_node UPDATE 6 = V6a, sim default ON (2026-11-13; car: off)
         DeclareLaunchArgument('gap_amcl_skip', default_value='false'),   # ekf_node UPDATE 6 (off)
-        DeclareLaunchArgument('gap_amcl_hold_s', default_value='0.0'),   # ekf_node UPDATE 6 (off)
-        DeclareLaunchArgument('gap_amcl_reopen_m', default_value='0.0'),   # ekf_node UPDATE 6 (off)
-        DeclareLaunchArgument('gap_amcl_reopen_deg', default_value='0.0'),   # ekf_node UPDATE 6 (off)
+        DeclareLaunchArgument('gap_amcl_hold_s', default_value='0.5'),   # ekf_node UPDATE 6 = V6a, sim default ON (2026-11-13; car: off)
+        DeclareLaunchArgument('gap_amcl_reopen_m', default_value='0.10'),   # ekf_node UPDATE 6 = V6a, sim default ON (2026-11-13; car: off)
+        DeclareLaunchArgument('gap_amcl_reopen_deg', default_value='3.0'),   # ekf_node UPDATE 6 = V6a, sim default ON (2026-11-13; car: off)
         DeclareLaunchArgument('order_inputs', default_value='true'),         # stamp-ordered inputs (2026-11-07, ON; false = old order)
         DeclareLaunchArgument('order_wait_s', default_value='0.025'),        # s without IMU = a dropout
         DeclareLaunchArgument('wheel_stuck_check', default_value='true'),    # F12 stuck wheel (2026-11-08, ON; false = old)
