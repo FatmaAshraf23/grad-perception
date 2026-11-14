@@ -41,7 +41,7 @@ REFERENCE POINT
 
 MODES (contract section 6, thresholds provisional = parameters)
     INIT     until the first accepted AMCL correction and std_xy <= 0.15 m
-    OK       std_xy <= 0.15 m and an accepted AMCL fix within the last 0.3 s of DRIVING
+    OK       std_xy <= 0.15 m and an accepted AMCL fix within the last 0.3 s of DRIVING (or the last 0.10 m, LOW SPEED below)
     DEGRADED std_xy 0.15-0.30 m, or 0.3-1.0 s of driving without an accepted fix,
              or (v0.3) FLAG_MAP_MISMATCH, or (v0.3) FLAG_ESTIMATOR_LAG, or (Fix 3) FLAG_WHEEL_SLIP
     LOST     std_xy > 0.30 m, or > 1.0 s of driving without an accepted fix
@@ -50,6 +50,14 @@ MODES (contract section 6, thresholds provisional = parameters)
     LiDAR staleness counts DRIVING time only: AMCL deliberately stops updating
     while the car stands still (update_min_d), which is not a fault -- and after
     a long wait at the start line the car must not be LOST the moment it sets off.
+    LOW SPEED (2026-11-15, lidar_stale_m 0.10 m, ON by default; 0.0 = the time rule above only): AMCL also only updates after
+    update_min_d of travel and then needs the next scan (7 Hz), so the time to the next fix is a whole
+    number of scan periods: 1 above ~0.35 m/s, 2 (0.286 s, 14 ms under the limit) at 0.3 m/s, 3 (0.43 s)
+    at 0.15 m/s -> "stale" although nothing is wrong (jobs 259-261, Simulation handoff APEX-LOC-2026-11-14).
+    With lidar_stale_m > 0 the LiDAR is stale only when BOTH are true: driven time since the fix >
+    lidar_stale_s AND driven distance since the fix > lidar_stale_m. Above lidar_stale_m / lidar_stale_s
+    (0.33 m/s for 0.10 m) the distance is always reached first -> identical to the time rule (job 261:
+    40 racing / fault bags, 7589 stale messages, none changed). LOST is unchanged (stale AND > lidar_lost_s).
 
 HEALTH CHECKS NEW IN CONTRACT v0.3 (2026-10-24; offline evidence: control_data/v03_threshold_eval.py)
     FLAG_MAP_MISMATCH (1024): ekf_global's map check says the pose is wrong (map_check.MismatchAlarm:
@@ -150,6 +158,7 @@ class StateEstimateNode(Node):
         d('std_lost_m', 0.30)
         d('lidar_stale_s', 0.3)
         d('lidar_lost_s', 1.0)
+        d('lidar_stale_m', 0.10)               # m driven since the fix that "stale" ALSO needs; 0 = time rule only (docstring LOW SPEED)
         d('moving_speed', 0.1)                 # m/s; below = standing still
         d('imu_stale_s', 0.025)                # sim IMU 100 Hz (real car 200 Hz -> 0.010)
         d('wheel_stale_s', 0.05)               # sim wheel 50 Hz (real car -> 0.030)
@@ -201,6 +210,7 @@ class StateEstimateNode(Node):
         self.last_imu_t = None
         self.last_fix_t = None                 # node clock (s) of the last ACCEPTED AMCL fix
         self.driven_since_fix = 0.0            # s of DRIVING since that fix (standing doesn't count)
+        self.dist_since_fix = 0.0              # m driven since that fix (lidar_stale_m)
         self.prev = None                       # (t_s, x, y, v, psi) of the previous EKF message
         self.reset_pending = False
         self.mode = SE.MODE_INIT
@@ -243,6 +253,7 @@ class StateEstimateNode(Node):
     def fix_cb(self, _msg):
         self.last_fix_t = self.now_s()
         self.driven_since_fix = 0.0
+        self.dist_since_fix = 0.0
         if self.imu_gap_state == 0:            # a fresh fix after the dropout's recovery (Fix 2)
             self.gap_need_fix = False
 
@@ -324,8 +335,11 @@ class StateEstimateNode(Node):
             dt_drive = (t_valid.nanoseconds * 1e-9) - self.prev[0]
             if 0.0 < dt_drive < 0.5:
                 self.driven_since_fix += dt_drive
+                self.dist_since_fix += abs(v) * dt_drive
         fix_age = None if self.last_fix_t is None else self.driven_since_fix
-        lidar_stale = moving and (fix_age is None or fix_age > p('lidar_stale_s'))
+        # stale = too long without a fix AND (lidar_stale_m > 0) far enough for AMCL to owe one (docstring LOW SPEED)
+        lidar_stale = moving and (fix_age is None or (fix_age > p('lidar_stale_s')
+                                                      and self.dist_since_fix > p('lidar_stale_m')))
         flags = SE.FLAG_VY_KINEMATIC if self.sideslip.kinematic else 0
         if lidar_stale:
             flags |= SE.FLAG_LIDAR_STALE
@@ -395,7 +409,8 @@ class StateEstimateNode(Node):
                 f', IMU DROPOUT {1000 * self.imu_gap_len:.0f} ms' if gap else (', after IMU dropout: waiting for a fix'
                                                                              if gap_degraded else ''))
             self.get_logger().info(f'mode {self.mode} -> {mode} (std_xy {std_xy*100:.1f} cm, '
-                                   f'driven since fix {fix_age if fix_age is None else round(fix_age, 2)} s{extra})')
+                                   f'driven since fix {fix_age if fix_age is None else round(fix_age, 2)} s, '
+                                   f'{self.dist_since_fix:.2f} m{extra})')
         self.mode = mode
 
         # message
