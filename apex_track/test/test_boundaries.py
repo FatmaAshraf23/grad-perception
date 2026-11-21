@@ -11,6 +11,9 @@ What each test proves:
   4. a boundaries file made for another centre line is REFUSED
   5. Pillow is only needed by the tool: loading a track never imports PIL
   6. with_boundaries=False -> no widths, width_at() raises
+  7. READY marker: the tool writes boundaries.csv atomically (no .tmp left) and READY last,
+     with the same track_hash / boundary_hash load_track() gives; a stale READY is removed
+     when the tool starts, and NOT rewritten if track.yaml has no boundaries line or the run fails
 """
 import math
 import os
@@ -153,6 +156,43 @@ except RuntimeError:
     raised = True
 check('6 with_boundaries=False -> width_at raises', not nb.has_boundaries and raised
       and nb.track_hash == lv.track_hash)
+
+# 7) atomic write + READY marker (race-day hand-over to planning)
+from apex_track.boundaries import main as boundaries_main, READY_FILE  # noqa: E402
+tmp = tempfile.mkdtemp()
+try:
+    _, ring_map = ring_track(tmp)
+    ty, ready = os.path.join(tmp, 'track.yaml'), os.path.join(tmp, READY_FILE)
+
+    # a) track.yaml WITHOUT a boundaries line + a stale READY -> csv written, READY removed, not rewritten
+    open(ready, 'w').write('stale\n')
+    boundaries_main([ty, '--map', ring_map])
+    check('7a csv written, no READY while track.yaml has no boundaries line',
+          os.path.exists(os.path.join(tmp, 'boundaries.csv')) and not os.path.exists(ready))
+
+    # b) with the boundaries line -> READY written last, hashes = what load_track gives
+    with open(ty, 'a') as f:
+        f.write('boundaries: boundaries.csv\n')
+    boundaries_main([ty, '--map', ring_map])
+    full = load_track(ty)
+    kv = dict(line.split('=', 1) for line in open(ready).read().split())
+    check('7b READY written with matching hashes',
+          kv.get('track_id') == 'ring' and kv.get('track_hash') == full.track_hash
+          and kv.get('boundary_hash') == full.boundary_hash and len(full.boundary_hash) == 16, str(kv))
+    check('7b no .tmp files left', not [f for f in os.listdir(tmp) if f.endswith('.tmp')])
+
+    # c) a failing remake (wrong map) removes READY and does not write a new one
+    with open(os.path.join(tmp, 'other.yaml'), 'w') as f:
+        f.write('image: ring.png\nresolution: 0.05\norigin: [-20.0, -20.0, 0.0]\n'
+                'negate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.196\n')
+    try:
+        boundaries_main([ty, '--map', os.path.join(tmp, 'other.yaml')])
+        failed = False
+    except ValueError:
+        failed = True
+    check('7c failed remake -> error and no READY', failed and not os.path.exists(ready))
+finally:
+    shutil.rmtree(tmp)
 
 print('ALL PASS' if ok else 'SOME FAILED')
 sys.exit(0 if ok else 1)

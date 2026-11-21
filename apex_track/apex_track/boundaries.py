@@ -52,6 +52,15 @@ MAKE / REMAKE IT (after the map or the centre line changes):
     (Needs Pillow to read the map image -- only this tool, not the runtime.)
 
 Real car: identical; --map = our slam_toolbox map (.yaml + .pgm).
+
+READY MARKER (race-day hand-over to planning):
+    boundaries.csv is written to boundaries.csv.tmp and then renamed (atomic: the file
+    is either absent or complete).  As the LAST step the tool loads the whole folder
+    with load_track() and only if that works writes  tracks/<name>/READY  (also atomic):
+        track_id=..  track_hash=..  boundary_hash=..  made=<UTC time>
+    The old READY is deleted when the tool starts, so READY present == the folder is
+    complete, loads, and belongs to the hashes written inside READY.
+    Reader rule: wait for READY, compare track_hash, then load_track(track.yaml).
 """
 import argparse
 import datetime
@@ -64,6 +73,8 @@ import numpy as np
 import yaml
 
 from .boundary_io import COLUMNS
+
+READY_FILE = 'READY'
 
 
 # --- map ---------------------------------------------------------------------
@@ -221,9 +232,16 @@ def compute_boundaries(track, map_yaml, max_w=2.0, step_m=None):
 
 # --- file ----------------------------------------------------------------------
 
+def _replace_atomic(tmp, path):
+    """Rename tmp -> path in one step (os.replace is atomic on Linux and Windows)."""
+    os.replace(tmp, path)
+
+
 def write_boundaries_csv(path, track, b):
+    """Write to <path>.tmp, flush to disk, then rename: readers never see a half file."""
     i = b['info']
-    with open(path, 'w', newline='\n') as f:
+    tmp = path + '.tmp'
+    with open(tmp, 'w', newline='\n') as f:
         f.write(f'# apex_track boundaries for track_id={track.track_id} track_hash={track.track_hash}\n')
         f.write(f'# map={os.path.basename(i["map"])} map_image_sha256={i["map_image_sha256"]} '
                 f'resolution={i["map_resolution"]}\n')
@@ -234,6 +252,31 @@ def write_boundaries_csv(path, track, b):
         f.write(','.join(COLUMNS) + '\n')
         for row in zip(b['s'], b['w_left'], b['w_right'], b['left_virtual'], b['right_virtual']):
             f.write(f'{row[0]:.4f},{row[1]:.4f},{row[2]:.4f},{int(row[3])},{int(row[4])}\n')
+        f.flush()
+        os.fsync(f.fileno())
+    _replace_atomic(tmp, path)
+
+
+def ready_path(track_yaml):
+    return os.path.join(os.path.dirname(os.path.abspath(track_yaml)), READY_FILE)
+
+
+def write_ready(track_yaml):
+    """Load the whole folder (centre line + boundaries, all hash checks); only if that
+    works write READY (atomic).  Raises if track.yaml has no boundaries line."""
+    from .track import load_track
+    t = load_track(track_yaml, with_boundaries=True)
+    if not t.has_boundaries:
+        raise ValueError(f'{track_yaml}: no "boundaries:" line -- not ready')
+    path = ready_path(track_yaml)
+    tmp = path + '.tmp'
+    with open(tmp, 'w', newline='\n') as f:
+        f.write(f'track_id={t.track_id}\ntrack_hash={t.track_hash}\nboundary_hash={t.boundary_hash}\n'
+                f'made={datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}\n')
+        f.flush()
+        os.fsync(f.fileno())
+    _replace_atomic(tmp, path)
+    return path
 
 
 # --- summary -------------------------------------------------------------------
@@ -291,6 +334,8 @@ def main(argv=None):
     ap.add_argument('--out', default=None, help='default: boundaries.csv next to track.yaml')
     a = ap.parse_args(argv)
 
+    if os.path.exists(ready_path(a.track_yaml)):      # a remake invalidates the old hand-over
+        os.remove(ready_path(a.track_yaml))
     track = load_track(a.track_yaml, with_boundaries=False)
     b = compute_boundaries(track, a.map, max_w=a.max_w)
     out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.track_yaml)), 'boundaries.csv')
@@ -298,8 +343,15 @@ def main(argv=None):
     print(summary(track, b))
     print(f'wrote {out}')
     with open(a.track_yaml, encoding='utf-8') as f:
-        if 'boundaries' not in yaml.safe_load(f):
-            print(f'NEXT: add the line   boundaries: {os.path.basename(out)}   to {a.track_yaml}')
+        cfg = yaml.safe_load(f)
+    named = cfg.get('boundaries')
+    if not named:
+        print(f'NEXT: add the line   boundaries: {os.path.basename(out)}   to {a.track_yaml}'
+              f'   then run this tool again (READY is written only when the folder loads).')
+    elif os.path.abspath(out) != os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(a.track_yaml)), named)):
+        print(f'NOT writing READY: --out is not the file named in track.yaml ({named}).')
+    else:
+        print(f'wrote {write_ready(a.track_yaml)}  (folder loads, hashes match: READY)')
 
 
 if __name__ == '__main__':
