@@ -31,7 +31,15 @@ Parameters
   range_offset_m  how much too FAR the LiDAR measures [m] (step 3.3), subtracted from every real return of the
                   alignment and of every aligned scan -- no effect with align_scans false. Simulator (f1tenth_gym ray
                   marching): 0.022. REAL CAR: measure it (default 0 = none).
-  stats_every_s   log line every ... s (scans, statuses, list size, work per scan, latency, alignment, CPU)
+  freeze_on_refused  true: a scan whose alignment is refused because the correction is too large (the scan itself
+                  says the pose is > 15 cm / 3 deg off) does not update the list (FROZEN_SCAN) -- phantom fix part a,
+                  2026-11-19. Needs align_scans. Default true (2026-11-21); false = the behaviour before the fix.
+  check_pose      true: after every accepted alignment, slide (+-0.6 m) and turn (+-6 deg) the pose; when a clearly
+                  different pose fits the walls clearly better, the scan does not update the list (FROZEN_SCAN) --
+                  phantom fix part b (obstacle_list.pose_check). Needs align_scans. Default true (2026-11-21);
+                  false = the behaviour before the fix.
+  stats_every_s   log line every ... s (scans, statuses, list size, work per scan, latency, alignment, phantom fix:
+                  scans frozen by each rule, the check's time and the largest gains it saw = the noise level, CPU)
 """
 import time
 
@@ -48,7 +56,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 from lidar_perception import obstacle_list as ol
 from lidar_perception.map_difference import CONE_RADIUS, MAX_RANGE, TOL
-from lidar_perception.scan_align import ScanAligner
+from lidar_perception.scan_align import MAX_SHIFT, MAX_TURN, ScanAligner
 from lidar_perception.wall_distance import WallDistance
 
 SCHEMA = 'apex-obstacles/0.1'
@@ -77,6 +85,8 @@ class ObstacleNode(Node):
         d('publish_markers', True)
         d('align_scans', True)
         d('range_offset_m', 0.0)
+        d('freeze_on_refused', True)
+        d('check_pose', True)
         d('stats_every_s', 5.0)
         p = lambda n: self.get_parameter(n).value  # noqa: E731
         self.mount = (float(p('laser_x')), float(p('laser_y')), float(p('laser_yaw')))
@@ -87,6 +97,8 @@ class ObstacleNode(Node):
         self.seq = 0
         self.align = bool(p('align_scans'))
         self.range_offset = float(p('range_offset_m'))
+        self.freeze_refused = bool(p('freeze_on_refused'))
+        self.check_pose = bool(p('check_pose'))
         self.stats = self.new_stats()
         self.last_stats = time.monotonic()
         self.last_cpu = time.process_time()
@@ -104,15 +116,20 @@ class ObstacleNode(Node):
             f'{self.mount} from the StateEstimate point; tolerance {TOL * 100:.0f} cm, range {MAX_RANGE:.0f} m; '
             f'scan alignment {"ON" if self.align else "OFF"}; range offset {self.range_offset * 100:.1f} cm'
             + (' (used for the alignment and every aligned scan)' if self.range_offset and self.align else '')
-            + '; waiting for /map')
+            + f'; phantom fix: freeze on refused alignment {"ON" if self.freeze_refused else "OFF"}, '
+            f'pose check {"ON" if self.check_pose else "OFF"}; waiting for /map')
         if self.range_offset and not self.align:
             self.get_logger().warn('range_offset_m is only used together with the scan alignment (align_scans true): '
                                    'unaligned scans keep the ranges as measured -- the offset has no effect now')
+        if (self.freeze_refused or self.check_pose) and not self.align:
+            self.get_logger().warn('freeze_on_refused / check_pose only work together with the scan alignment '
+                                   '(align_scans true) -- they have no effect now')
 
     @staticmethod
     def new_stats():
         return dict(scans=0, nopose=0, dropped=0, status={}, work=[], latency=[], share=[], pose_n=0, pose_s=0.0,
-                    al_ok=0, al_no=0, al_shift=[], al_turn=[], al_us=[])
+                    al_ok=0, al_no=0, al_shift=[], al_turn=[], al_us=[],
+                    frz_ref=0, frz_chk=0, chk_us=[], chk_ga=[], chk_gy=[], warned=False)
 
     # ------------------------------------------------------------------ inputs
     def map_cb(self, msg):
@@ -121,7 +138,8 @@ class ObstacleNode(Node):
         t0 = time.perf_counter()
         wd = WallDistance(grid, info.resolution, info.origin.position.x, info.origin.position.y)
         aligner = ScanAligner(wd, grid) if self.align else None
-        self.builder = ol.ObstacleList(wd, self.mount, aligner, self.range_offset)   # a new map = a new list
+        self.builder = ol.ObstacleList(wd, self.mount, aligner, self.range_offset,     # a new map = a new list
+                                       freeze_on_refused=self.freeze_refused, check_pose=self.check_pose)
         self.get_logger().info(f'/map {info.width} x {info.height} @ {info.resolution:.3f} m: distance-to-wall grid'
                                + (' + signed distance field for the alignment' if aligner else '')
                                + f' built in {(time.perf_counter() - t0) * 1000:.0f} ms ({int(wd.wall.sum())} wall cells)')
@@ -239,6 +257,25 @@ class ObstacleNode(Node):
             st['al_us'].append(res['align_us'])
         elif self.align and res['status'] != ol.STATUS_FROZEN_LOCALIZATION:
             st['al_no'] += 1
+        chk = res.get('check')                                 # phantom fix (obstacle_list 2b / 2c)
+        if chk is not None:
+            st['chk_us'].append(res['check_us'])
+            st['chk_ga'].append(chk['gain_along'])
+            st['chk_gy'].append(chk['gain_yaw'])
+        why = None
+        if res['status'] == ol.STATUS_FROZEN_SCAN and chk is not None and chk['suspect']:
+            st['frz_chk'] += 1
+            why = (f'pose check: the pose {chk["best_along"]:+.2f} m along fits {chk["gain_along"] * 100:.1f} % more of '
+                   f'the scan, turned {np.degrees(chk["best_yaw"]):+.2f} deg {chk["gain_yaw"] * 100:.1f} % more')
+        elif (res['status'] == ol.STATUS_FROZEN_SCAN and self.freeze_refused
+              and res.get('refused') == ol.REFUSED_TOO_FAR):
+            st['frz_ref'] += 1
+            why = (f'alignment refused: the correction it needs is larger than {MAX_SHIFT * 100:.0f} cm / '
+                   f'{np.degrees(MAX_TURN):.0f} deg')
+        if why and not st['warned']:                           # at most one warning per stats window
+            self.get_logger().warn(f'scan not used (FROZEN_SCAN) -- {why}. The pose looks wrong although '
+                                   'StateEstimate may still say OK; the list keeps its obstacles.')
+            st['warned'] = True
         ids = {tr.id for tr in res['obstacles']}
         for tid in sorted(ids - self.known_ids):
             tr = next(t for t in res['obstacles'] if t.id == tid)
@@ -257,13 +294,19 @@ class ObstacleNode(Node):
                   f'/ {np.degrees(np.median(st["al_turn"])):.2f} deg, max {max(st["al_shift"]) * 100:.1f} cm, '
                   f'{np.median(st["al_us"]):.0f} us each; ' if st['al_ok'] else
                   (f'aligned 0 (refused {st["al_no"]}); ' if self.align else ''))
+            fx = ''
+            if self.freeze_refused or self.check_pose:
+                fx = (f'phantom fix: frozen by refused alignment {st["frz_ref"]}, by pose check {st["frz_chk"]}'
+                      + (f' (check {np.median(st["chk_us"]):.0f} us each, largest gain along '
+                         f'{max(st["chk_ga"]) * 100:.1f} % / heading {max(st["chk_gy"]) * 100:.1f} %)'
+                         if st['chk_us'] else '') + '; ')
             self.get_logger().info(
                 f'{st["scans"]} scans ({st["nopose"]} without pose, {st["dropped"]} dropped): '
                 + ', '.join(f'{k} {v}' for k, v in sorted(st['status'].items()))
                 + f'; list {len(ids)}; work per scan mean {w.mean():.0f} us, max {w.max():.0f} us; latency '
                 f'mean {lat.mean():.1f} ms, max {lat.max():.1f} ms; new points max {max(st["share"]) * 100:.1f} %; '
                 f'{st["pose_n"]} poses at {st["pose_s"] / max(st["pose_n"], 1) * 1e6:.0f} us each; '
-                + al + f'node CPU {cpu:.1f} % of one core')
+                + al + fx + f'node CPU {cpu:.1f} % of one core')
             self.stats = self.new_stats()
             self.last_stats = now
             self.last_cpu = time.process_time()

@@ -31,11 +31,52 @@ process_scan():
      wall points lie on the map's walls (scan_align.py) -- obstacle positions then carry the alignment's smaller
      pose error, and its own (honest) std_xy / std_psi replaces StateEstimate's. Refused alignments (too few wall
      points, correction too large) keep StateEstimate's pose. The safety rules above stay as they are.
+     freeze_on_refused (phantom fix part a, 2026-11-19): a refusal because the correction is TOO LARGE means this
+     scan itself says StateEstimate's pose is more than scan_align.MAX_SHIFT / MAX_TURN off -> the scan does NOT
+     update the list (STATUS_FROZEN_SCAN, like the new-point guard). Without it, a pose 15-20 cm off along the
+     track (StateEstimate still OK) made dozens of phantom obstacles in the corners, because the refused scans were
+     detected with the wrong pose (planning's phantoms near s 37.5 on closed1). Too few wall points proves nothing
+     either way -> detected with StateEstimate's pose as before. Off (False) = the behaviour before this fix.
+     Measured (phantom_update/phantom_fix_compare.py): 15 recordings (normal laps, EKF fault 0.86 m / 10 deg,
+     4.5 m/s) unchanged -- 0 of 8,218 messages differ (the alignment never refused 'too large' there; the fault
+     scans were refused for too few wall points and were already RESET / FROZEN_SCAN). Pose-error sweep on job 090
+     run A, along +15 / +20 / -15 / -20 cm: 36 / 75 / 5 / 53 -> 6 / 15 / 0 / 9 phantoms. NOT stopped: phantoms
+     made in scans the alignment ACCEPTED (along 30-50 cm, yaw 3 deg) -> phantom fix part b.
+  2c. POSE CHECK (check_pose, phantom fix part b, 2026-11-19; needs the aligner): the alignment is local -- it only
+     uses points already within GATE (15 cm) of a wall, and a 3 cm miss already halves a point's weight. With a
+     larger pose error (along 30-50 cm, or 3 deg of heading seen at 3+ m) exactly the points that show the error are
+     ignored, the walls parallel to the error fit anyway, and a small wrong correction is ACCEPTED -> wall points
+     become phantoms. So after an accepted alignment, pose_check() slides the aligned pose along its heading
+     (+-0.6 m, 4 cm steps) and turns it (+-6 deg, 0.5 deg steps) and counts the scan's points within CHECK_TOL
+     (5 cm) of a wall surface that FACES the LiDAR (a point pushed into a wall must not fit the wall's far side --
+     with thick map walls and unknown behind, an error of one wall thickness looked like a perfect fit). If a pose
+     at least 8 cm further along / back, or turned at least 1 deg, fits clearly better (CHECK_GAIN = 1.5 % more of
+     the scan's points), the pose is wrong -> the scan does NOT update the list (STATUS_FROZEN_SCAN). Only offsets
+     that big count: in clean scans the best fit is always at <= 2 cm / <= 0.5 deg (noise); at >= 8 cm their gain
+     is <= 0.0030, at >= 1 deg there is none. Second tier: a gain >= CHECK_GAIN_ANY (4 %) counts at ANY offset --
+     after the alignment a COMBINED error (e.g. 20 cm back + 5 cm sideways + 0.3 deg in a corner) shows a big gain
+     already at a small slide (4-6 cm); clean scans never gain more than 0.0194 at any offset.
+     Measured (phantom_update/phantom_fix_compare.py, both switches on vs off): 15 recordings unchanged (0 scans
+     flagged, 0 of 8,218 messages differ). Pose-error sweep on job 090 run A (StateEstimate kept OK), WALL phantoms
+     before -> after: along +10/+15/+20/+30/+50 cm 1/36/75/55/39 -> 0, -15/-20 cm 5/53 -> 0, -30 cm 46 -> 1 (7 s,
+     corner s 42); drift to 0.3/0.5 m 40/48 -> 0; heading +3/-3/+5 deg 18/57/201 -> 0. At 4.5 m/s (job 271 R3):
+     along +15/+20/+30/-20 cm 11/42/35/28 -> 0, -30 cm 17 -> 2 (9 s), heading +-3 deg 26/11 -> 0, drift 19 -> 0.
+     NOT caught: (1) a COMBINED error left after the alignment in a corner (pose 30 cm behind: along + sideways +
+     heading) can pass in 2 scans in a row -- and such a phantom stays, because an obstacle right in front of a wall
+     is never "seen through" by the forgetting rule (StateEstimate's map-mismatch alarm is meant for 30-95 cm);
+     (2) an along error on a STRAIGHT puts a REAL cone at the wrong spot (the open cone 30/50 cm off in the sweep):
+     walls parallel to the error cannot show it -- StateEstimate's job. While the pose is wrong the list is frozen a
+     lot (along 30 cm: 483 of 498 scans), so new cones are not added. Cost ~2 ms per scan (laptop VM).
+     Thresholds are simulator values: re-measure on real data (the node logs the largest gains it sees).
+     With either switch on, a scan that does not update the list still AGES the tentative obstacles
+     (tracker.expire): otherwise one from before a long freeze could be confirmed by a single detection after it.
   3. otherwise DETECT (map_difference) and TRACK (obstacle_tracker: match, average, confirm, remember, forget),
      telling the tracker how sure the pose is (std_xy, std_psi; step 3.1): detections made with an unsure pose
      count less and make the reported sigma larger.
 Returns dict(status, epoch, obstacles = confirmed tracks, seen_now = {id: bool}, pose, pose_std, aligned,
-correction (shift m, turn rad), new_share, n_points, n_objects) -- or None when there is no pose for the scan's time.
+correction (shift m, turn rad), refused (the alignment's reason when it refused the scan, else ''), check (the
+pose check's numbers, see pose_check(), or None), check_us, new_share, n_points, n_objects) -- or None when there
+is no pose for the scan's time.
 numpy only.
 """
 import math
@@ -45,10 +86,10 @@ from collections import deque
 import numpy as np
 
 try:                                    # inside the ROS package lidar_perception
-    from lidar_perception.map_difference import lidar_position, new_points, objects, scan_to_map
+    from lidar_perception.map_difference import MAX_RANGE, lidar_position, new_points, objects, scan_to_map
     from lidar_perception.obstacle_tracker import ObstacleTracker
 except ImportError:                     # offline, next to map_difference.py / obstacle_tracker.py
-    from map_difference import lidar_position, new_points, objects, scan_to_map
+    from map_difference import MAX_RANGE, lidar_position, new_points, objects, scan_to_map
     from obstacle_tracker import ObstacleTracker
 
 STATUS_OK, STATUS_FROZEN_LOCALIZATION, STATUS_FROZEN_SCAN, STATUS_RESET = 0, 1, 2, 3
@@ -58,6 +99,16 @@ JUMP_POS = 0.20                      # m beyond what the speed explains, between
 JUMP_YAW = math.radians(5)           # rad beyond what the yaw rate explains -> jump
 MAX_EXTRAPOLATION = 0.05             # s: a scan newer than the newest pose by more than this gets no pose
 POSE_BUFFER_S = 2.0                  # s of poses kept for interpolation
+REFUSED_TOO_FAR = 'correction too large'   # scan_align's reason when the scan says the pose is too far off
+CHECK_ALONG = np.linspace(-0.60, 0.60, 31)            # m: pose check, shifts along the heading (4 cm steps, 0 = middle)
+CHECK_YAW = np.radians(np.linspace(-6.0, 6.0, 25))    # rad: pose check, heading offsets (0.5 deg steps, 0 = middle)
+CHECK_TOL = 0.05                     # m: a point "fits" when it is this close to a wall surface
+CHECK_GAIN = 0.015                   # share of the scan's points that must fit better at the offset
+CHECK_MIN_ALONG = 0.07               # m: BETWEEN the 4 cm steps -> offsets >= 8 cm count (clean gain there <= 0.0030)
+CHECK_MIN_YAW = math.radians(0.875)  # rad: BETWEEN the 0.5 deg steps -> offsets >= 1 deg count (clean: never there)
+CHECK_GAIN_ANY = 0.04                # a gain this big counts at ANY offset (combined errors; clean max 0.0194)
+CHECK_BEAM_STEP = 1                  # pose check uses every n-th real return. 2 halves the work but DOUBLES the clean
+                                     # noise (any-offset gain 0.033, too close to CHECK_GAIN_ANY) -> keep 1
 
 
 def _wrap(a):
@@ -74,6 +125,49 @@ def correct_ranges(ranges, range_min, range_max, offset):
     return r
 
 
+def _best_offset(fit, offsets):
+    """(gain, offset): best fit minus the fit at offset 0 (the middle element), and the middle of the best plateau."""
+    top = fit.max()
+    on_top = np.flatnonzero(fit >= top - 1e-12)
+    return float(top - fit[len(fit) // 2]), float(offsets[on_top[len(on_top) // 2]])
+
+
+def pose_check(field, ranges, angle_min, angle_inc, range_min, range_max, pose, mount):
+    """Phantom fix part b (see 2c): would a pose further along / back or turned fit the walls clearly better than
+    `pose`? field = ScanAligner.field (signed distance to the nearest wall surface, its gradient, inside-the-map
+    flags). A point fits when it is within CHECK_TOL of a wall surface that FACES the LiDAR.
+    Returns dict(fit, gain_along, best_along [m], gain_yaw, best_yaw [rad], suspect)."""
+    r = np.asarray(ranges, dtype=float)
+    k = np.arange(len(r))
+    good = np.isfinite(r) & (r >= range_min) & (r < range_max - 1e-3) & (r <= MAX_RANGE)
+    use = k[good][::CHECK_BEAM_STEP]
+    if not len(use):
+        return dict(fit=0.0, gain_along=0.0, best_along=0.0, gain_yaw=0.0, best_yaw=0.0, suspect=False)
+    a = mount[2] + angle_min + use * angle_inc
+    vx, vy = mount[0] + r[use] * np.cos(a), mount[1] + r[use] * np.sin(a)        # points in the car frame
+    x, y, yaw = pose
+    n_a, n_y = len(CHECK_ALONG), len(CHECK_YAW)
+    xs = np.concatenate([x + CHECK_ALONG * math.cos(yaw), np.full(n_y, x)])
+    ys = np.concatenate([y + CHECK_ALONG * math.sin(yaw), np.full(n_y, y)])
+    yaws = np.concatenate([np.full(n_a, yaw), yaw + CHECK_YAW])
+    cs, sn = np.cos(yaws)[:, None], np.sin(yaws)[:, None]
+    px, py = xs[:, None] + cs * vx - sn * vy, ys[:, None] + sn * vx + cs * vy
+    lx = xs + np.cos(yaws) * mount[0] - np.sin(yaws) * mount[1]          # the LiDAR, for every candidate pose
+    ly = ys + np.sin(yaws) * mount[0] + np.cos(yaws) * mount[1]
+    e, gx, gy, inside = (v.reshape(px.shape) for v in field(px.ravel(), py.ravel()))
+    # a point fits only on a wall surface that FACES the LiDAR (the field rises towards the sensor), as in
+    # scan_align: a point pushed INTO a wall by a pose error must not fit the wall's far side (thick map walls with
+    # unknown behind: an error of one wall thickness would otherwise look like a perfect fit)
+    facing = gx * (lx[:, None] - px) + gy * (ly[:, None] - py) > 0.0
+    fit = np.mean(inside & facing & (np.abs(e) <= CHECK_TOL), axis=1)
+    ga, ba = _best_offset(fit[:n_a], CHECK_ALONG)
+    gy, by = _best_offset(fit[n_a:], CHECK_YAW)
+    suspect = ((ga >= CHECK_GAIN and abs(ba) >= CHECK_MIN_ALONG) or (gy >= CHECK_GAIN and abs(by) >= CHECK_MIN_YAW)
+               or max(ga, gy) >= CHECK_GAIN_ANY)
+    return dict(fit=float(fit[n_a // 2]), gain_along=ga, best_along=ba, gain_yaw=gy, best_yaw=by,
+                suspect=bool(suspect))
+
+
 def pose_jumped(prev, now, v, w):
     """prev / now = (t, x, y, yaw); v, w = speed and yaw rate at prev. True if the pose moved more than the car can."""
     dt = now[0] - prev[0]
@@ -84,11 +178,14 @@ def pose_jumped(prev, now, v, w):
 
 
 class ObstacleList:
-    def __init__(self, wall_distance, mount, aligner=None, range_offset=0.0):
+    def __init__(self, wall_distance, mount, aligner=None, range_offset=0.0, freeze_on_refused=False,
+                 check_pose=False):
         self.wd = wall_distance
         self.mount = mount                   # (x, y, yaw) of the LiDAR relative to the pose's point
         self.aligner = aligner               # scan_align.ScanAligner or None (step 3.1 behaviour)
         self.range_offset = float(range_offset)   # m this LiDAR measures too far (step 3.3); 0 = no correction
+        self.freeze_on_refused = bool(freeze_on_refused)   # phantom fix part a (see 2b); False = before the fix
+        self.check_pose = bool(check_pose)                 # phantom fix part b (see 2c); False = before the fix
         self.tracker = ObstacleTracker()
         self.poses = deque()                 # (t, x, y, yaw unwrapped, v, r, ok, (std_xy, std_psi) or None)
         self.jump_pending = False
@@ -139,7 +236,8 @@ class ObstacleList:
         if pose is None:
             return None
         x, y, yaw, ok, pose_std = pose
-        aligned, correction, align_us = False, (0.0, 0.0), 0.0
+        aligned, correction, align_us, refused = False, (0.0, 0.0), 0.0, ''
+        check, check_us = None, 0.0
         if ok and self.aligner is not None and pose_std is not None:
             corrected = correct_ranges(ranges, range_min, range_max, self.range_offset) if self.range_offset else ranges
             t0 = time.perf_counter()
@@ -150,6 +248,13 @@ class ObstacleList:
                 (x, y, yaw), pose_std = al['pose'], al['std']
                 aligned, correction = True, (al['shift'], al['turn'])
                 ranges = corrected                             # see 0.: only an aligned scan uses them
+                if self.check_pose:                            # 2c
+                    t1 = time.perf_counter()
+                    check = pose_check(self.aligner.field, ranges, angle_min, angle_inc, range_min, range_max,
+                                       (x, y, yaw), self.mount)
+                    check_us = (time.perf_counter() - t1) * 1e6
+            else:
+                refused = al.get('reason') or 'refused'
         reset = self.jump_pending
         if reset:
             self.tracker.reset()
@@ -162,7 +267,8 @@ class ObstacleList:
         n_obj, updated = 0, False
         if not ok:
             status = STATUS_FROZEN_LOCALIZATION
-        elif share > MAX_NEW_SHARE:
+        elif (share > MAX_NEW_SHARE or (self.freeze_on_refused and refused == REFUSED_TOO_FAR)
+              or (check is not None and check['suspect'])):
             status = STATUS_FROZEN_SCAN
         else:
             objs = objects(px[keep], py[keep], (lx, ly))
@@ -171,8 +277,11 @@ class ObstacleList:
                         range_max=range_max, lidar=(lx, ly, lyaw))
             self.tracker.update(t, objs, scan, pose_std)
             status, updated = STATUS_OK, True
+        if not updated and (self.freeze_on_refused or self.check_pose):
+            self.tracker.expire(t)     # a frozen scan still ages TENTATIVE obstacles (ObstacleTracker.expire)
         confirmed = [tr for tr in self.tracker.tracks if tr.confirmed]
         return dict(status=STATUS_RESET if reset else status, epoch=self.epoch, obstacles=confirmed,
                     seen_now={tr.id: bool(updated and tr.seen_now) for tr in confirmed},
                     pose=(x, y, yaw), pose_std=pose_std, aligned=aligned, correction=correction, align_us=align_us,
+                    refused=refused, check=check, check_us=check_us,
                     new_share=share, n_points=len(px), n_objects=n_obj)

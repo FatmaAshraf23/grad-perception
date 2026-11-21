@@ -197,6 +197,13 @@ class ObstacleTracker:
         was computed with the old pose, and nothing tells which of them are still right (step 2.6)."""
         self.tracks = []
 
+    def expire(self, t):
+        """Drop the tentative obstacles not seen within TENTATIVE_TIMEOUT before time t -- nothing is matched, added or
+        forgotten. For scans that do NOT update the list (frozen, phantom fix 2026-11-19): update() matches first and
+        drops afterwards, so without this a tentative obstacle from BEFORE a long freeze could be confirmed by a single
+        detection seconds AFTER it (seen in the pose-error sweep, 50 cm case: such a wall phantom then stayed 35 s)."""
+        self.tracks = [tr for tr in self.tracks if tr.confirmed or t - tr.last_t <= TENTATIVE_TIMEOUT]
+
     def update(self, t, objects, scan=None, pose_std=None):
         """Feed the objects of one scan (time t [s]); with `scan` (see look_through) also rule 6 FORGET.
         pose_std = (std_xy [m], std_psi [rad]) of the pose the objects were computed with (StateEstimate's own

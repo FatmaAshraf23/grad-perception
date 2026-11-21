@@ -8,6 +8,10 @@ align_scans: true = put every scan on the map's walls before detection (step 3.2
 range_offset: how much too FAR the LiDAR measures [m] (step 3.3), subtracted from the returns used by the alignment and
   every aligned scan (no effect with align_scans:=false). Default 0 (none); simulator (f1tenth_gym):
   range_offset:=0.022; REAL CAR: measure it (e.g. the car at a taped distance from a flat wall). Write it with a dot.
+freeze_on_refused / check_pose: the phantom fix (2026-11-19), both need align_scans. freeze_on_refused:=true = a scan
+  whose alignment says the pose is > 15 cm / 3 deg off does not update the list; check_pose:=true = after the
+  alignment, a scan is not used when a clearly different pose fits the walls clearly better. Both FROZEN_SCAN.
+  Default true (2026-11-21); false = the behaviour before the fix.
 numpy_threads: BLAS threads (CPU rule, 2026-10-03) -- 1.
 """
 from launch import LaunchDescription
@@ -27,6 +31,8 @@ def generate_launch_description():
         DeclareLaunchArgument('laser_yaw', default_value='0.0'),
         DeclareLaunchArgument('align_scans', default_value='true'),
         DeclareLaunchArgument('range_offset', default_value='0.0'),
+        DeclareLaunchArgument('freeze_on_refused', default_value='true'),
+        DeclareLaunchArgument('check_pose', default_value='true'),
         DeclareLaunchArgument('numpy_threads', default_value='1'),
         SetEnvironmentVariable('OPENBLAS_NUM_THREADS', LaunchConfiguration('numpy_threads')),
         SetEnvironmentVariable('OMP_NUM_THREADS', LaunchConfiguration('numpy_threads')),
@@ -35,5 +41,7 @@ def generate_launch_description():
              parameters=[{'track': LaunchConfiguration('track'), 'scan_topic': LaunchConfiguration('scan_topic'),
                           'laser_x': f('laser_x'), 'laser_y': f('laser_y'), 'laser_yaw': f('laser_yaw'),
                           'align_scans': ParameterValue(LaunchConfiguration('align_scans'), value_type=bool),
-                          'range_offset_m': f('range_offset')}]),
+                          'range_offset_m': f('range_offset'),
+                          'freeze_on_refused': ParameterValue(LaunchConfiguration('freeze_on_refused'), value_type=bool),
+                          'check_pose': ParameterValue(LaunchConfiguration('check_pose'), value_type=bool)}]),
     ])
