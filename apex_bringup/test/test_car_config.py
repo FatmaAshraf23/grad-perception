@@ -43,7 +43,7 @@ def loc_specs(cfg):
 # ---------------------------------------------------------------- car_config
 def test_shipped_file_loads_with_placeholder_warnings():
     cfg, warn = load_car_config(CAR_YAML)
-    assert cfg['lf'] == 0.15875 and cfg['beta_model'] == 'steer'
+    assert cfg['lf'] == 0.1285 and cfg['lr'] == 0.1285 and cfg['beta_model'] == 'steer'
     assert cfg['calibration_dir'].endswith(os.path.join('.ros', 'apex_car'))
     for n in cfg['not_measured']:
         assert any(w.startswith(n + ' = ') for w in warn), n

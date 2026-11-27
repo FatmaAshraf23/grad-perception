@@ -15,8 +15,9 @@ not_measured: [lf, lr, imu_yaw_deg, wheel_delay_s, slip_lag_s, imu_gap_s, slip_r
 calibration_dir: ~/.ros/apex_car
 
 vehicle:
-  lf: 0.15875          # m, centre of gravity -> FRONT axle. Placeholder = F1TENTH reference car. Get it from the
-  lr: 0.17145          # m, centre of gravity -> REAR axle.  vehicle-dynamics teammate: the MPC must use the SAME.
+  lf: 0.1285           # m, centre of gravity -> FRONT axle. PLACEHOLDER: wheelbase lf + lr = 0.257 m is measured
+  lr: 0.1285           # m, centre of gravity -> REAR axle.  (27 Nov), the 50/50 SPLIT is assumed. Weigh the axles:
+                       # lf = 0.257 x rear/total, lr = 0.257 x front/total. The MPC must use the SAME values.
   imu_yaw_deg: 0.0     # deg, how the IMU's x axis is turned against the car's forward axis (CCW +). 0 = x forward
   beta_model: steer    # sideslip model: steer (kinematic, nothing to fit) until slip_k is fitted on REAL laps,
   slip_k: 0.0          # s^2/m: then beta_model: slip with the slip_k that car_slip_calib found
