@@ -13,6 +13,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-matplotlib python3-opencv \
     && rm -rf /var/lib/apt/lists/*
 
+# Live view on the laptop: Foxglove connects to ws://<Pi IP>:8765
+# (own layer, so adding it does not rebuild the dependency layer above)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ros-humble-foxglove-bridge \
+    && rm -rf /var/lib/apt/lists/*
+
 # Non-root user with the Pi user's UID, so files written to the mounted workspace belong to the Pi user
 ARG UID=1000
 RUN useradd -m -u ${UID} -s /bin/bash dev

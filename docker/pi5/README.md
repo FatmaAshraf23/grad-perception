@@ -15,6 +15,7 @@ The car's Pi 5 runs Raspberry Pi OS (Debian 13), which is not a Humble platform,
 - `~/run_ros.sh` starts the container (`--net=host`, workspace mounted from `~/ros2_ws`, `/dev/ttyUSB0` if present).
 - `~/ros_shell.sh` opens a second shell in it.
 - `ros2 launch apex_bringup car.launch.py localization:=false` runs the LiDAR stage.
+- Live view: `ros2 launch foxglove_bridge foxglove_bridge_launch.xml` in the container, then in Foxglove on the laptop open a connection to `ws://<Pi IP>:8765` (laptop and Pi on the same network).
 
 ## Notes
 - Plug the LiDAR in BEFORE `run_ros.sh`; devices are fixed when the container starts.
